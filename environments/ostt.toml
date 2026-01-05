@@ -54,6 +54,15 @@ output_format = "mp3 -ab 16k -ar 12000"
 #   "waveform"  - Time-domain waveform showing amplitude over time
 visualization = "spectrum"
 
+# Optional transcription overrides (bypass `ostt auth`)
+# Note: Prefer env vars for api_key: OSTT_TRANSCRIPTION_API_KEY
+#
+# [transcription]
+# provider = "openai"        # openai, deepgram, deepinfra, groq
+# model = "gpt-4o-mini-transcribe"
+# endpoint = "https://api.openai.com/v1/audio/transcriptions"
+# api_key = "sk-..."
+
 # Provider-specific settings
 # Each provider can have its own configuration section
 

@@ -46,8 +46,8 @@ pub async fn transcribe(
     // Build the URL with model name in the path
     let endpoint = format!(
         "{}/{}",
-        config.model.endpoint(),
-        config.model.api_model_name()
+        config.endpoint(),
+        config.api_model_name()
     );
 
     // Add keywords as prompt for better transcription context (similar to OpenAI)
@@ -58,9 +58,15 @@ pub async fn transcribe(
         tracing::debug!("Keywords used as prompt for DeepInfra model: {:?}", config.keywords);
     }
 
+    let auth_header = if config.api_key.is_empty() {
+        "Authorization: none"
+    } else {
+        "Authorization: Bearer <redacted>"
+    };
     tracing::debug!(
-        "DeepInfra API Call:\n  URL: {}\n  Method: POST\n  Headers:\n    Authorization: Bearer <redacted>\n    Content-Type: multipart/form-data\n  Body parameters: {}",
+        "DeepInfra API Call:\n  URL: {}\n  Method: POST\n  Headers:\n    {}\n    Content-Type: multipart/form-data\n  Body parameters: {}",
         endpoint,
+        auth_header,
         if debug_params.is_empty() {
             "none".to_string()
         } else {
@@ -68,13 +74,11 @@ pub async fn transcribe(
         }
     );
 
-    let response = match client
-        .post(&endpoint)
-        .bearer_auth(&config.api_key)
-        .multipart(form)
-        .send()
-        .await
-    {
+    let mut request = client.post(&endpoint).multipart(form);
+    if !config.api_key.is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    let response = match request.send().await {
         Ok(resp) => resp,
         Err(e) => {
             let error_msg = if e.is_connect() {
@@ -95,7 +99,10 @@ pub async fn transcribe(
         let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
 
         let human_readable = match status.as_u16() {
-            401 => "DeepInfra API key is invalid or expired. Please run 'ostt auth' to update your API key.".to_string(),
+            401 => format!(
+                "DeepInfra API key is invalid or expired. {}",
+                config.auth_hint()
+            ),
             403 => "You don't have permission to use DeepInfra's API. Check your API key and account status.".to_string(),
             429 => "Too many requests to DeepInfra. You've hit the API rate limit. Please wait and try again.".to_string(),
             500 | 502 | 503 | 504 => "DeepInfra API server is experiencing issues. Please try again later.".to_string(),

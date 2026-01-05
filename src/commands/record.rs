@@ -7,6 +7,7 @@ use crate::clipboard::copy_to_clipboard;
 use crate::config;
 use crate::history::HistoryManager;
 use crate::recording::{AudioRecorder, OsttTui, RecordingCommand};
+use crate::transcription;
 use crate::transcription::TranscriptionAnimation;
 use crate::ui::ErrorScreen;
 use dirs;
@@ -146,28 +147,38 @@ pub async fn handle_record() -> Result<(), anyhow::Error> {
         })?;
 
     if should_transcribe {
-        // Get the selected model from secrets (stored when user runs 'ostt auth')
-        let selected_model_id = config::get_selected_model().ok().flatten();
-
-        if let Some(model_id) = selected_model_id {
-            let filepath_str = filepath.to_string_lossy().to_string();
-            if let Err(e) = transcribe_recording_with_animation(
-                &mut tui,
-                &config_data,
-                &model_id,
-                &filepath_str,
-            )
-            .await
-            {
-                tracing::warn!("Transcription failed: {}", e);
-                eprintln!("Warning: Transcription failed: {e}");
+        let filepath_str = filepath.to_string_lossy().to_string();
+        match resolve_transcription_config(&config_data) {
+            Ok(Some(transcription_config)) => {
+                if let Err(e) = transcribe_recording_with_animation(
+                    &mut tui,
+                    transcription_config,
+                    &filepath_str,
+                )
+                .await
+                {
+                    tracing::warn!("Transcription failed: {}", e);
+                    eprintln!("Warning: Transcription failed: {e}");
+                }
             }
-        } else {
-            tracing::debug!("No transcription model configured");
-            tui.cleanup().ok();
-            let mut error_screen = ErrorScreen::new()?;
-            error_screen.show_error("Error: No transcription model configured.\n\nPlease run 'ostt auth' to select a model.")?;
-            error_screen.cleanup()?;
+            Ok(None) => {
+                tracing::debug!("No transcription model configured");
+                tui.cleanup().ok();
+                let mut error_screen = ErrorScreen::new()?;
+                error_screen.show_error(
+                    "Error: No transcription model configured.\n\nSet OSTT_TRANSCRIPTION_MODEL (and OSTT_TRANSCRIPTION_API_KEY) or run 'ostt auth'.",
+                )?;
+                error_screen.cleanup()?;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to resolve transcription settings: {}", e);
+                tui.cleanup().ok();
+                let mut error_screen = ErrorScreen::new()?;
+                error_screen.show_error(&format!(
+                    "Error: Failed to configure transcription.\n\n{e}"
+                ))?;
+                error_screen.cleanup()?;
+            }
         }
     }
 
@@ -178,77 +189,124 @@ pub async fn handle_record() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Transcribes an audio recording with animated progress indicator.
-///
-/// # Errors
-/// - If the model ID is invalid
-/// - If no API key is configured for the provider
-/// - If transcription fails
-async fn transcribe_recording_with_animation(
-    tui: &mut OsttTui,
+fn resolve_transcription_config(
     config_data: &config::OsttConfig,
-    model_id: &str,
-    audio_filename: &str,
-) -> anyhow::Result<()> {
-    use crate::transcription;
+) -> anyhow::Result<Option<transcription::TranscriptionConfig>> {
+    let overrides = config::load_transcription_overrides(config_data);
+    let using_override = overrides.is_configured();
+    let selected_model_id = config::get_selected_model().ok().flatten();
 
-    let model = match transcription::TranscriptionModel::from_id(model_id) {
-        Some(m) => m,
-        None => {
-            tui.cleanup().ok();
-            let mut error_screen = ErrorScreen::new()?;
-            error_screen.show_error(&format!("Error: Unknown model '{model_id}'"))?;
-            error_screen.cleanup()?;
-            return Err(anyhow::anyhow!("Unknown model: {model_id}"));
+    let model_value = match overrides.model.clone().or(selected_model_id) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let provider_override = match overrides.provider.as_deref() {
+        Some(raw) => Some(parse_provider_override(raw)?),
+        None => None,
+    };
+
+    let (model, api_model_name_override, provider) =
+        match transcription::TranscriptionModel::from_id(&model_value) {
+            Some(model) => {
+                if let Some(provider_override) = provider_override {
+                    if provider_override != model.provider() {
+                        return Err(anyhow::anyhow!(
+                            "Override provider '{}' does not match model '{}'.",
+                            provider_override.id(),
+                            model_value
+                        ));
+                    }
+                }
+                let provider = model.provider();
+                (model, None, provider)
+            }
+            None => {
+                let provider = provider_override.unwrap_or_else(|| {
+                    tracing::debug!(
+                        "No provider override set for custom model '{}'; defaulting to OpenAI-compatible API.",
+                        model_value
+                    );
+                    transcription::TranscriptionProvider::OpenAI
+                });
+                let model = transcription::TranscriptionModel::default_for_provider(&provider);
+                (model, Some(model_value), provider)
+            }
+        };
+
+    let api_key = if using_override {
+        overrides.api_key.unwrap_or_default()
+    } else {
+        match config::get_api_key(provider.id())? {
+            Some(key) => key,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "No API key for {}. Set OSTT_TRANSCRIPTION_API_KEY or run 'ostt auth'.",
+                    provider.name()
+                ));
+            }
         }
     };
 
-    let provider = model.provider();
+    let keywords = load_keywords()?;
 
-    let api_key = match config::get_api_key(provider.id())? {
-        Some(key) => key,
-        None => {
-            tui.cleanup().ok();
-            let mut error_screen = ErrorScreen::new()?;
-            error_screen.show_error(&format!(
-                "Error: No API key for {}. Please run 'ostt auth'",
-                provider.name()
-            ))?;
-            error_screen.cleanup()?;
-            return Err(anyhow::anyhow!(
-                "No API key found for provider '{}'. Please run 'ostt auth' to authorize this provider.",
-                provider.id()
-            ));
-        }
-    };
+    Ok(Some(transcription::TranscriptionConfig::new_with_overrides(
+        model,
+        api_key,
+        keywords,
+        config_data.providers.clone(),
+        api_model_name_override,
+        overrides.endpoint,
+        using_override,
+    )))
+}
 
-    // Load keywords
+fn parse_provider_override(raw: &str) -> anyhow::Result<transcription::TranscriptionProvider> {
+    let normalized = raw.trim().to_lowercase();
+    transcription::TranscriptionProvider::from_id(&normalized).ok_or_else(|| {
+        let providers = transcription::TranscriptionProvider::all()
+            .iter()
+            .map(|provider| provider.id())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!(
+            "Unknown transcription provider '{}'. Expected one of: {}.",
+            raw,
+            providers
+        )
+    })
+}
+
+fn load_keywords() -> anyhow::Result<Vec<String>> {
     let config_dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
         .join(".config")
         .join("ostt");
     let keywords_file = config_dir.join("keywords.txt");
-    let keywords = if keywords_file.exists() {
+    if keywords_file.exists() {
         let content = fs::read_to_string(&keywords_file)?;
-        content
+        Ok(content
             .lines()
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty())
-            .collect()
+            .collect())
     } else {
-        Vec::new()
-    };
+        Ok(Vec::new())
+    }
+}
 
-    let transcription_config = transcription::TranscriptionConfig::new(
-        model,
-        api_key,
-        keywords,
-        config_data.providers.clone(),
-    );
-
+/// Transcribes an audio recording with animated progress indicator.
+///
+/// # Errors
+/// - If transcription fails
+async fn transcribe_recording_with_animation(
+    tui: &mut OsttTui,
+    transcription_config: transcription::TranscriptionConfig,
+    audio_filename: &str,
+) -> anyhow::Result<()> {
     tracing::debug!(
         "Starting transcription with model '{}' for file '{}'",
-        model_id,
+        transcription_config.model_label(),
         audio_filename
     );
 

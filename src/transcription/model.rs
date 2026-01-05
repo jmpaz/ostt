@@ -152,4 +152,14 @@ impl TranscriptionModel {
             .cloned()
             .collect()
     }
+
+    /// Returns a default model for a provider (used for custom overrides).
+    pub fn default_for_provider(provider: &TranscriptionProvider) -> Self {
+        match provider {
+            TranscriptionProvider::OpenAI => TranscriptionModel::Whisper,
+            TranscriptionProvider::Deepgram => TranscriptionModel::DeepgramNova3,
+            TranscriptionProvider::DeepInfra => TranscriptionModel::DeepInfraWhisperLargeV3,
+            TranscriptionProvider::Groq => TranscriptionModel::GroqWhisperLargeV3,
+        }
+    }
 }

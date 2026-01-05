@@ -27,6 +27,12 @@ pub struct TranscriptionConfig {
     pub keywords: Vec<String>,
     /// Provider-specific configurations
     pub providers: ProvidersConfig,
+    /// Override for the API model name sent to the provider.
+    pub api_model_name_override: Option<String>,
+    /// Override for the provider endpoint URL.
+    pub endpoint_override: Option<String>,
+    /// Whether env/config overrides are active.
+    pub using_override: bool,
 }
 
 impl TranscriptionConfig {
@@ -42,6 +48,56 @@ impl TranscriptionConfig {
             api_key,
             keywords,
             providers,
+            api_model_name_override: None,
+            endpoint_override: None,
+            using_override: false,
+        }
+    }
+
+    /// Creates a new transcription configuration with optional overrides.
+    pub fn new_with_overrides(
+        model: TranscriptionModel,
+        api_key: String,
+        keywords: Vec<String>,
+        providers: ProvidersConfig,
+        api_model_name_override: Option<String>,
+        endpoint_override: Option<String>,
+        using_override: bool,
+    ) -> Self {
+        Self {
+            model,
+            api_key,
+            keywords,
+            providers,
+            api_model_name_override,
+            endpoint_override,
+            using_override,
+        }
+    }
+
+    pub fn api_model_name(&self) -> &str {
+        self.api_model_name_override
+            .as_deref()
+            .unwrap_or_else(|| self.model.api_model_name())
+    }
+
+    pub fn endpoint(&self) -> &str {
+        self.endpoint_override
+            .as_deref()
+            .unwrap_or_else(|| self.model.endpoint())
+    }
+
+    pub fn model_label(&self) -> &str {
+        self.api_model_name_override
+            .as_deref()
+            .unwrap_or_else(|| self.model.id())
+    }
+
+    pub fn auth_hint(&self) -> &'static str {
+        if self.using_override {
+            "Set OSTT_TRANSCRIPTION_API_KEY if your endpoint requires auth."
+        } else {
+            "Please run 'ostt auth' to update your API key."
         }
     }
 }
@@ -70,7 +126,7 @@ pub async fn transcribe(
     tracing::info!(
         "Transcribing with {} ({})",
         config.model.provider().name(),
-        config.model.id()
+        config.model_label()
     );
 
     let result = match config.model.provider() {

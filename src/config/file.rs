@@ -10,18 +10,15 @@ use std::path::PathBuf;
 /// Visualization type for recording display.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum VisualizationType {
     /// Time-domain waveform showing amplitude over time
     Waveform,
     /// Frequency spectrum showing energy distribution across frequencies
+    #[default]
     Spectrum,
 }
 
-impl Default for VisualizationType {
-    fn default() -> Self {
-        Self::Spectrum
-    }
-}
 
 impl std::fmt::Display for VisualizationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,12 +148,31 @@ pub struct ProvidersConfig {
     pub openai: OpenAiConfig,
 }
 
+/// Optional transcription overrides (env/config driven).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranscriptionOverrideConfig {
+    /// Override provider (openai, deepgram, deepinfra, groq).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Override model ID or API model name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Override API endpoint URL.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Override API key (use env var if possible to avoid storing in config).
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
 /// Complete application configuration.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OsttConfig {
     pub audio: AudioConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
+    #[serde(default)]
+    pub transcription: TranscriptionOverrideConfig,
 }
 
 impl OsttConfig {
@@ -199,6 +215,7 @@ impl OsttConfig {
                 visualization: VisualizationType::default(),
             },
             providers: ProvidersConfig::default(),
+            transcription: TranscriptionOverrideConfig::default(),
         }
     }
 }

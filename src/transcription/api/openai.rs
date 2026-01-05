@@ -42,17 +42,17 @@ pub async fn transcribe(
 
     let mut form = reqwest::multipart::Form::new()
         .part("file", file_part)
-        .text("model", config.model.api_model_name().to_string());
+        .text("model", config.api_model_name().to_string());
 
     // Debug log: Log the API call details (without the audio data)
     let mut debug_params = vec![
-        format!("model={}", config.model.api_model_name()),
+        format!("model={}", config.api_model_name()),
     ];
 
     // Add keywords as prompt for better transcription context
     // Note: gpt-4o-transcribe doesn't support prompt parameter, only whisper-1 and gpt-4o-mini-transcribe do
     if !config.keywords.is_empty() {
-        let should_use_prompt = match config.model.api_model_name() {
+        let should_use_prompt = match config.api_model_name() {
             "gpt-4o-transcribe" => false, // gpt-4o-transcribe doesn't support prompt
             _ => true, // whisper-1 and gpt-4o-mini-transcribe support it
         };
@@ -64,27 +64,31 @@ pub async fn transcribe(
             tracing::debug!("Keywords used as prompt for OpenAI model: {:?}", config.keywords);
         } else {
             tracing::debug!("Keywords defined but {} does not support prompt parameter. Keywords: {:?}", 
-                config.model.api_model_name(), config.keywords);
+                config.api_model_name(), config.keywords);
         }
     }
 
-    let endpoint = config.model.endpoint();
+    let endpoint = config.endpoint();
     let url = format!("{endpoint}?response_format=json");
     debug_params.push("response_format=json".to_string());
 
+    let auth_header = if config.api_key.is_empty() {
+        "Authorization: none"
+    } else {
+        "Authorization: Bearer <redacted>"
+    };
     tracing::debug!(
-        "OpenAI API Call:\n  URL: {}\n  Method: POST\n  Headers:\n    Authorization: Bearer <redacted>\n    Content-Type: multipart/form-data\n  Body parameters: {}",
+        "OpenAI API Call:\n  URL: {}\n  Method: POST\n  Headers:\n    {}\n    Content-Type: multipart/form-data\n  Body parameters: {}",
         url,
+        auth_header,
         debug_params.join("\n    ")
     );
 
-    let response = match client
-        .post(&url)
-        .bearer_auth(&config.api_key)
-        .multipart(form)
-        .send()
-        .await
-    {
+    let mut request = client.post(&url).multipart(form);
+    if !config.api_key.is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    let response = match request.send().await {
         Ok(resp) => resp,
         Err(e) => {
             let error_msg = if e.is_connect() {
@@ -105,7 +109,10 @@ pub async fn transcribe(
         let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
 
         let human_readable = match status.as_u16() {
-            401 => "OpenAI API key is invalid or expired. Please run 'ostt auth' to update your API key.".to_string(),
+            401 => format!(
+                "OpenAI API key is invalid or expired. {}",
+                config.auth_hint()
+            ),
             403 => "You don't have permission to use OpenAI's API. Check your API key and account status.".to_string(),
             429 => "Too many requests to OpenAI. You've hit the API rate limit. Please wait and try again.".to_string(),
             500 | 502 | 503 | 504 => "OpenAI API server is experiencing issues. Please try again later.".to_string(),

@@ -7,7 +7,6 @@ use serde::Deserialize;
 use urlencoding;
 
 use super::TranscriptionConfig;
-use super::super::model::TranscriptionModel;
 
 /// Deepgram response structure (kept for potential future use)
 #[allow(dead_code)]
@@ -52,8 +51,8 @@ pub async fn transcribe(
     // Build the API URL with query parameters
     let mut url = format!(
         "{}?model={}",
-        config.model.endpoint(),
-        config.model.api_model_name()
+        config.endpoint(),
+        config.api_model_name()
     );
 
     // Add Deepgram feature flags from provider configuration
@@ -91,24 +90,24 @@ pub async fn transcribe(
 
     // Add keywords/keyterms if any (nova-3 uses keyterms, nova-2 uses keywords)
     if !config.keywords.is_empty() {
-        let param_name = match config.model {
-            TranscriptionModel::DeepgramNova3 => "keyterm",
-            TranscriptionModel::DeepgramNova2 => "keywords",
-            _ => "keywords", // fallback
+        let param_name = if config.api_model_name() == "nova-3" {
+            "keyterm"
+        } else {
+            "keywords"
         };
         for keyword in &config.keywords {
             url.push_str(&format!("&{}={}", param_name, urlencoding::encode(keyword)));
         }
     }
 
-    let response = match client
+    let mut request = client
         .post(&url)
-        .header("Authorization", format!("Token {}", config.api_key))
         .header("Content-Type", "audio/mpeg")
-        .body(audio_data)
-        .send()
-        .await
-    {
+        .body(audio_data);
+    if !config.api_key.is_empty() {
+        request = request.header("Authorization", format!("Token {}", config.api_key));
+    }
+    let response = match request.send().await {
         Ok(resp) => resp,
         Err(e) => {
             let error_msg = if e.is_connect() {
@@ -129,7 +128,10 @@ pub async fn transcribe(
         let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
 
         let human_readable = match status.as_u16() {
-            401 => "Deepgram API key is invalid or expired. Please run 'ostt auth' to update your API key.".to_string(),
+            401 => format!(
+                "Deepgram API key is invalid or expired. {}",
+                config.auth_hint()
+            ),
             403 => "You don't have permission to use Deepgram's API. Check your API key and account status.".to_string(),
             429 => "Too many requests to Deepgram. You've hit the API rate limit. Please wait and try again.".to_string(),
             500 | 502 | 503 | 504 => "Deepgram API server is experiencing issues. Please try again later.".to_string(),
