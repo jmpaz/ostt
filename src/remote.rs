@@ -9,24 +9,48 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOutputMode {
+    Paste,
+    Type,
+}
+
+impl RemoteOutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteOutputMode::Paste => "paste",
+            RemoteOutputMode::Type => "type",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "type" | "typed" | "manual" => Some(RemoteOutputMode::Type),
+            "paste" => Some(RemoteOutputMode::Paste),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteSignal {
-    Complete,
+    Complete(Option<RemoteOutputMode>),
     Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteCommand {
-    Complete,
+    Complete(Option<RemoteOutputMode>),
     Cancel,
     Ping,
 }
 
 impl RemoteCommand {
-    pub fn as_str(self) -> &'static str {
+    pub fn message(self) -> String {
         match self {
-            RemoteCommand::Complete => "complete",
-            RemoteCommand::Cancel => "cancel",
-            RemoteCommand::Ping => "ping",
+            RemoteCommand::Complete(Some(mode)) => format!("complete {}", mode.as_str()),
+            RemoteCommand::Complete(None) => "complete".to_string(),
+            RemoteCommand::Cancel => "cancel".to_string(),
+            RemoteCommand::Ping => "ping".to_string(),
         }
     }
 }
@@ -66,7 +90,7 @@ pub async fn send_command(command: RemoteCommand) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("Remote socket not available at {}", path.display()))?;
 
-    let message = format!("{}\n", command.as_str());
+    let message = format!("{}\n", command.message());
     stream.write_all(message.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
@@ -135,9 +159,14 @@ async fn handle_client(
         return Ok(());
     }
 
-    match line.trim().to_ascii_lowercase().as_str() {
+    let mut parts = line.split_whitespace();
+    let command = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let arg = parts.next();
+
+    match command.as_str() {
         "complete" => {
-            let _ = tx.send(RemoteSignal::Complete);
+            let mode = arg.and_then(RemoteOutputMode::parse);
+            let _ = tx.send(RemoteSignal::Complete(mode));
         }
         "cancel" => {
             let _ = tx.send(RemoteSignal::Cancel);

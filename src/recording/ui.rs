@@ -416,6 +416,7 @@ impl OsttTui {
         &mut self,
         text: &str,
         typed_count: usize,
+        header_label: &str,
     ) -> Result<(), Box<dyn Error>> {
         let total = text.chars().count();
         let typed = typed_count.min(total);
@@ -454,7 +455,7 @@ impl OsttTui {
 
             if show_header {
                 let percent = (ratio * 100.0).round() as u16;
-                let status = format!("typing via ydotool  {typed}/{total}  {percent}%");
+                let status = format!("{header_label}  {typed}/{total}  {percent}%");
                 let header_area = Rect {
                     x: area.x,
                     y: area.y,

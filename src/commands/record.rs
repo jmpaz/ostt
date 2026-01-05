@@ -133,13 +133,15 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
     let mut frame_count = 0u64;
     let mut should_transcribe = false;
     let mut typing_error = None;
+    let mut remote_output_override = None;
 
     'recording: loop {
         if let Some(rx) = remote_rx.as_mut() {
             if let Ok(signal) = rx.try_recv() {
                 match signal {
-                    remote::RemoteSignal::Complete => {
+                    remote::RemoteSignal::Complete(mode) => {
                         tracing::info!("Received remote completion command");
+                        remote_output_override = mode;
                         should_transcribe = true;
                         break 'recording;
                     }
@@ -232,10 +234,14 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
                 {
                     Ok(text) => {
                         if mode == RecordingMode::Remote {
-                            if let Err(err) =
-                                type_transcription_with_feedback(&mut tui, &text).await
+                            if let Err(err) = output_transcription_with_feedback(
+                                &mut tui,
+                                &text,
+                                remote_output_override,
+                            )
+                            .await
                             {
-                                tracing::warn!("Typing failed: {}", err);
+                                tracing::warn!("Remote output failed: {}", err);
                                 typing_error = Some(err);
                             }
                         }
@@ -469,16 +475,37 @@ async fn transcribe_recording_with_animation(
     }
 }
 
+async fn output_transcription_with_feedback(
+    tui: &mut OsttTui,
+    text: &str,
+    output_override: Option<remote::RemoteOutputMode>,
+) -> anyhow::Result<()> {
+    match resolve_output_mode(output_override) {
+        remote::RemoteOutputMode::Paste => {
+            send_paste_shortcut().await?;
+            let header = paste_header_label();
+            stream_transcription_preview(tui, text, &header).await?;
+        }
+        remote::RemoteOutputMode::Type => {
+            let header = type_header_label();
+            type_transcription_with_feedback(tui, text, &header).await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn type_transcription_with_feedback(
     tui: &mut OsttTui,
     text: &str,
+    header_label: &str,
 ) -> anyhow::Result<()> {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     let delay_ms = read_type_delay_ms();
     let start_delay_ms = read_type_start_delay_ms();
 
-    tui.render_typing_progress(text, 0)
+    tui.render_typing_progress(text, 0, header_label)
         .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
 
     if total == 0 {
@@ -508,7 +535,7 @@ async fn type_transcription_with_feedback(
         let slice = ch.encode_utf8(&mut buf);
         stdin.write_all(slice.as_bytes()).await?;
         stdin.flush().await?;
-        tui.render_typing_progress(text, idx + 1)
+        tui.render_typing_progress(text, idx + 1, header_label)
             .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
 
         if delay_ms > 0 {
@@ -525,6 +552,98 @@ async fn type_transcription_with_feedback(
     Ok(())
 }
 
+async fn stream_transcription_preview(
+    tui: &mut OsttTui,
+    text: &str,
+    header_label: &str,
+) -> anyhow::Result<()> {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    tui.render_typing_progress(text, 0, header_label)
+        .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    let duration_ms = read_stream_duration_ms();
+    let frame_ms = 16u64;
+    let frames = ((duration_ms / frame_ms).max(1)) as usize;
+    let step = total.div_ceil(frames);
+
+    let mut typed = 0usize;
+    for _ in 0..frames {
+        typed = (typed + step).min(total);
+        tui.render_typing_progress(text, typed, header_label)
+            .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+        tokio::time::sleep(Duration::from_millis(frame_ms)).await;
+    }
+
+    if typed < total {
+        tui.render_typing_progress(text, total, header_label)
+            .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+    }
+
+    Ok(())
+}
+
+async fn send_paste_shortcut() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = tokio::process::Command::new(ydotool_bin())
+            .args(["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to run ydotool: {e}"))?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("ydotool exited with status {status}"));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = tokio::process::Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"System Events\" to keystroke \"v\" using command down",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to run osascript: {e}"))?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("osascript exited with status {status}"));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(anyhow::anyhow!(
+            "Paste shortcut not supported on this platform"
+        ))
+    }
+}
+
+fn resolve_output_mode(
+    override_mode: Option<remote::RemoteOutputMode>,
+) -> remote::RemoteOutputMode {
+    override_mode.unwrap_or_else(read_output_mode)
+}
+
+fn read_output_mode() -> remote::RemoteOutputMode {
+    let raw = std::env::var("OSTT_REMOTE_OUTPUT_MODE")
+        .unwrap_or_else(|_| "paste".to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "type" | "typed" | "manual" => remote::RemoteOutputMode::Type,
+        _ => remote::RemoteOutputMode::Paste,
+    }
+}
+
 fn read_type_delay_ms() -> u64 {
     std::env::var("OSTT_REMOTE_TYPE_DELAY_MS")
         .ok()
@@ -537,6 +656,33 @@ fn read_type_start_delay_ms() -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(120)
+}
+
+fn read_stream_duration_ms() -> u64 {
+    std::env::var("OSTT_REMOTE_STREAM_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(50, 5000))
+        .unwrap_or(300)
+}
+
+fn paste_header_label() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "pasted via cmd+v".to_string()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "pasted via ctrl+shift+v".to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "pasted".to_string()
+    }
+}
+
+fn type_header_label() -> String {
+    "typing via ydotool".to_string()
 }
 
 fn ydotool_bin() -> String {

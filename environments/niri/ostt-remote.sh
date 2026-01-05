@@ -6,6 +6,23 @@ OSTT_CLASS="${OSTT_CLASS:-com.local.ostt}"
 OSTT_SOCKET="${OSTT_REMOTE_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/ostt.sock}"
 OSTT_LAUNCH_CMD="${OSTT_LAUNCH_CMD:-ghostty --class ${OSTT_CLASS} -e ${OSTT_BIN} remote}"
 
+ACTION="complete"
+OUTPUT_MODE="${OSTT_REMOTE_OUTPUT_MODE:-paste}"
+
+for arg in "$@"; do
+    case "$arg" in
+        cancel|--cancel)
+            ACTION="cancel"
+            ;;
+        type|typed|manual|--type)
+            OUTPUT_MODE="type"
+            ;;
+        paste|--paste)
+            OUTPUT_MODE="paste"
+            ;;
+    esac
+done
+
 has_ostt_window() {
     if command -v niri >/dev/null 2>&1; then
         niri msg -j 2>/dev/null \
@@ -16,15 +33,31 @@ has_ostt_window() {
 }
 
 if has_ostt_window; then
-    "${OSTT_BIN}" remote complete || true
+    if [ "${ACTION}" = "complete" ] && [ "${OUTPUT_MODE}" = "type" ]; then
+        "${OSTT_BIN}" remote "${ACTION}" type || true
+    else
+        "${OSTT_BIN}" remote "${ACTION}" || true
+    fi
     exit 0
 fi
 
 if [ -S "${OSTT_SOCKET}" ]; then
     if "${OSTT_BIN}" remote ping >/dev/null 2>&1; then
-        "${OSTT_BIN}" remote complete || true
+        if [ "${ACTION}" = "complete" ] && [ "${OUTPUT_MODE}" = "type" ]; then
+            "${OSTT_BIN}" remote "${ACTION}" type || true
+        else
+            "${OSTT_BIN}" remote "${ACTION}" || true
+        fi
         exit 0
     fi
 fi
 
-exec bash -c "${OSTT_LAUNCH_CMD}"
+if [ "${ACTION}" = "cancel" ]; then
+    exit 0
+fi
+
+if [ "${OUTPUT_MODE}" != "paste" ]; then
+    exec bash -c "OSTT_REMOTE_OUTPUT_MODE=${OUTPUT_MODE} ${OSTT_LAUNCH_CMD}"
+else
+    exec bash -c "${OSTT_LAUNCH_CMD}"
+fi

@@ -51,7 +51,7 @@ enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteAction {
     Listen,
-    Complete,
+    Complete(Option<remote::RemoteOutputMode>),
     Cancel,
     Ping,
 }
@@ -74,6 +74,7 @@ COMMANDS:
                         Use "ostt remote complete" to stop and transcribe
 
     remote complete     Send completion command to running remote instance
+                        Optional mode: paste | type
     remote cancel       Send cancel command to running remote instance
     remote ping         Check if remote instance socket is available
 
@@ -140,7 +141,21 @@ impl Command {
                     } else {
                         match args[2].as_str() {
                             "listen" => Command::Remote(RemoteAction::Listen),
-                            "complete" => Command::Remote(RemoteAction::Complete),
+                            "complete" => {
+                                let mode = if let Some(raw) = args.get(3) {
+                                    match remote::RemoteOutputMode::parse(raw) {
+                                        Some(parsed) => Some(parsed),
+                                        None => {
+                                            return Command::Invalid(format!(
+                                                "remote complete {raw}"
+                                            ))
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                Command::Remote(RemoteAction::Complete(mode))
+                            }
                             "cancel" => Command::Remote(RemoteAction::Cancel),
                             "ping" => Command::Remote(RemoteAction::Ping),
                             invalid => Command::Invalid(format!("remote {invalid}")),
@@ -210,10 +225,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if let Command::Remote(action) = &command {
         if matches!(
             action,
-            RemoteAction::Complete | RemoteAction::Cancel | RemoteAction::Ping
+            RemoteAction::Complete(_) | RemoteAction::Cancel | RemoteAction::Ping
         ) {
             let command = match action {
-                RemoteAction::Complete => remote::RemoteCommand::Complete,
+                RemoteAction::Complete(mode) => remote::RemoteCommand::Complete(*mode),
                 RemoteAction::Cancel => remote::RemoteCommand::Cancel,
                 RemoteAction::Ping => remote::RemoteCommand::Ping,
                 RemoteAction::Listen => unreachable!(),
