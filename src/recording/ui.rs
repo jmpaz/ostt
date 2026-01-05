@@ -10,8 +10,9 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    style::{Color, Style},
-    widgets::Sparkline,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Gauge, Paragraph, Sparkline},
 };
 use std::error::Error;
 use std::io::{stdout, Stdout};
@@ -407,6 +408,125 @@ impl OsttTui {
         Ok(())
     }
 
+    /// Renders the typing progress once transcription has completed.
+    ///
+    /// # Errors
+    /// - If terminal rendering fails
+    pub fn render_typing_progress(
+        &mut self,
+        text: &str,
+        typed_count: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let total = text.chars().count();
+        let typed = typed_count.min(total);
+        let ratio = if total == 0 {
+            1.0
+        } else {
+            typed as f64 / total as f64
+        };
+
+        let typed_style = Style::default().fg(Color::Rgb(245, 245, 245));
+        let untyped_style = Style::default().fg(Color::Rgb(110, 118, 129));
+        let cursor_style = Style::default()
+            .fg(Color::Rgb(0, 0, 0))
+            .bg(Color::Rgb(245, 245, 245))
+            .add_modifier(Modifier::BOLD);
+        let header_style = Style::default()
+            .fg(Color::Rgb(185, 207, 212))
+            .bg(Color::Rgb(0, 0, 0));
+
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    frame
+                        .buffer_mut()
+                        .set_string(x, y, " ", Style::default().bg(Color::Rgb(0, 0, 0)));
+                }
+            }
+
+            let show_header = area.height >= 3;
+            let show_footer = area.height >= 4;
+            let header_height = if show_header { 1 } else { 0 };
+            let footer_height = if show_footer { 1 } else { 0 };
+            let text_height = area.height.saturating_sub(header_height + footer_height);
+
+            if show_header {
+                let percent = (ratio * 100.0).round() as u16;
+                let status = format!("typing via ydotool  {typed}/{total}  {percent}%");
+                let header_area = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: 1,
+                };
+                let header = Paragraph::new(status)
+                    .alignment(Alignment::Center)
+                    .style(header_style);
+                frame.render_widget(header, header_area);
+            }
+
+            let text_area = Rect {
+                x: area.x,
+                y: area.y + header_height,
+                width: area.width,
+                height: text_height,
+            };
+
+            let use_border = text_area.width > 6 && text_area.height > 4;
+            let inner_area = if use_border {
+                frame.render_widget(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Rgb(80, 90, 95))),
+                    text_area,
+                );
+                Rect {
+                    x: text_area.x + 1,
+                    y: text_area.y + 1,
+                    width: text_area.width.saturating_sub(2),
+                    height: text_area.height.saturating_sub(2),
+                }
+            } else {
+                text_area
+            };
+
+            if inner_area.width > 0 && inner_area.height > 0 {
+                let lines = build_typing_lines(
+                    text,
+                    typed,
+                    inner_area.width as usize,
+                    inner_area.height as usize,
+                    typed_style,
+                    untyped_style,
+                    cursor_style,
+                );
+                let paragraph = Paragraph::new(lines);
+                frame.render_widget(paragraph, inner_area);
+            }
+
+            if show_footer {
+                let footer_area = Rect {
+                    x: area.x,
+                    y: area.y + area.height.saturating_sub(1),
+                    width: area.width,
+                    height: 1,
+                };
+                let gauge = Gauge::default()
+                    .gauge_style(
+                        Style::default()
+                            .fg(Color::Rgb(206, 224, 220))
+                            .bg(Color::Rgb(30, 30, 30)),
+                    )
+                    .ratio(ratio);
+                frame.render_widget(gauge, footer_area);
+            }
+        })?;
+
+        Ok(())
+    }
+
     /// Cleans up terminal state and exits alternate screen mode.
     ///
     /// # Errors
@@ -421,4 +541,159 @@ impl OsttTui {
         self.terminal.show_cursor()?;
         Ok(())
     }
+}
+
+fn build_typing_lines(
+    text: &str,
+    typed_count: usize,
+    max_width: usize,
+    max_height: usize,
+    typed_style: Style,
+    untyped_style: Style,
+    cursor_style: Style,
+) -> Vec<Line<'static>> {
+    if max_width == 0 || max_height == 0 {
+        return Vec::new();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![Line::from(Span::styled(String::new(), untyped_style))];
+    }
+
+    let typed = typed_count.min(chars.len());
+    let ranges = wrap_text_ranges(&chars, max_width);
+    let total_lines = ranges.len().max(1);
+
+    let cursor_index = if typed < chars.len() { Some(typed) } else { None };
+    let mut cursor_line = total_lines.saturating_sub(1);
+    if let Some(cursor) = cursor_index {
+        for (idx, (start, end)) in ranges.iter().enumerate() {
+            if (*start <= cursor && cursor < *end) || (*start == *end && cursor == *start) {
+                cursor_line = idx;
+                break;
+            }
+        }
+    }
+
+    let window_height = max_height.min(total_lines);
+    let mut start_line = cursor_line.saturating_sub(window_height / 2);
+    let end_line = (start_line + window_height).min(total_lines);
+    if end_line - start_line < window_height {
+        start_line = end_line.saturating_sub(window_height);
+    }
+
+    let mut lines = Vec::new();
+    for (start, end) in ranges[start_line..end_line].iter().copied() {
+        lines.push(build_line(
+            &chars,
+            start,
+            end,
+            typed,
+            typed_style,
+            untyped_style,
+            cursor_style,
+        ));
+    }
+
+    if lines.len() < max_height {
+        let padding = (max_height - lines.len()) / 2;
+        for _ in 0..padding {
+            lines.insert(0, Line::from(Span::raw("")));
+        }
+    }
+
+    lines
+}
+
+fn build_line(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    typed_count: usize,
+    typed_style: Style,
+    untyped_style: Style,
+    cursor_style: Style,
+) -> Line<'static> {
+    if start >= end {
+        return Line::from(Span::raw(""));
+    }
+
+    let line_len = end - start;
+    let typed_len = typed_count.saturating_sub(start).min(line_len);
+    let has_cursor = typed_count < chars.len() && typed_count >= start && typed_count < end;
+
+    let mut spans = Vec::new();
+    if typed_len > 0 {
+        spans.push(Span::styled(
+            chars[start..start + typed_len].iter().collect::<String>(),
+            typed_style,
+        ));
+    }
+
+    if has_cursor {
+        let cursor_char = chars[typed_count];
+        spans.push(Span::styled(cursor_char.to_string(), cursor_style));
+        if typed_count + 1 < end {
+            spans.push(Span::styled(
+                chars[typed_count + 1..end].iter().collect::<String>(),
+                untyped_style,
+            ));
+        }
+    } else if typed_len < line_len {
+        spans.push(Span::styled(
+            chars[start + typed_len..end].iter().collect::<String>(),
+            untyped_style,
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn wrap_text_ranges(chars: &[char], max_width: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    if max_width == 0 {
+        return ranges;
+    }
+
+    let mut idx = 0;
+    while idx < chars.len() {
+        if chars[idx] == '\n' {
+            ranges.push((idx, idx));
+            idx += 1;
+            continue;
+        }
+
+        let mut end = (idx + max_width).min(chars.len());
+
+        if let Some(newline_offset) = chars[idx..end].iter().position(|c| *c == '\n') {
+            end = idx + newline_offset;
+            ranges.push((idx, end));
+            idx = end + 1;
+            continue;
+        }
+
+        if end < chars.len() {
+            if let Some(space_offset) = chars[idx..end].iter().rposition(|c| c.is_whitespace()) {
+                let space_idx = idx + space_offset;
+                if space_idx > idx {
+                    ranges.push((idx, space_idx));
+                    idx = space_idx + 1;
+                    continue;
+                }
+            }
+        }
+
+        ranges.push((idx, end));
+        idx = end;
+        while idx < chars.len() && chars[idx].is_whitespace() && chars[idx] != '\n' {
+            idx += 1;
+        }
+    }
+
+    if ranges.is_empty() {
+        ranges.push((0, 0));
+    }
+
+    ranges
 }

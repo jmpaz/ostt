@@ -4,6 +4,7 @@
 
 use crate::commands;
 use crate::logging;
+use crate::remote;
 use anyhow::anyhow;
 use dirs;
 use std::env;
@@ -24,6 +25,8 @@ fn suppress_alsa_warnings() {
 enum Command {
     /// Record audio and optionally transcribe
     Record,
+    /// Record audio with remote IPC control
+    Remote(RemoteAction),
     /// Authenticate with a transcription provider and select model
     Auth,
     /// View transcription history
@@ -44,6 +47,15 @@ enum Command {
     Invalid(String),
 }
 
+/// Remote control actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAction {
+    Listen,
+    Complete,
+    Cancel,
+    Ping,
+}
+
 const HELP_TEXT: &str = r#"
 ┏┓┏╋╋
 ┗┛┛┗┗
@@ -57,6 +69,13 @@ USAGE:
 COMMANDS:
     record              Record audio with real-time volume metering
                         Press Enter to transcribe, Escape/q to cancel
+
+    remote              Record with local IPC control (for hotkey scripts)
+                        Use "ostt remote complete" to stop and transcribe
+
+    remote complete     Send completion command to running remote instance
+    remote cancel       Send cancel command to running remote instance
+    remote ping         Check if remote instance socket is available
 
     auth                Authenticate with a transcription provider and
                         select a model. Handles both provider selection
@@ -83,7 +102,10 @@ COMMANDS:
 EXAMPLES:
     # Record audio
     $ ostt record
-    
+
+    # Remote-controlled recording
+    $ ostt remote
+
     # Set up authentication and select a model
     $ ostt auth
     
@@ -112,6 +134,19 @@ impl Command {
         if args.len() > 1 {
             match args[1].as_str() {
                 "record" => Command::Record,
+                "remote" => {
+                    if args.len() < 3 {
+                        Command::Remote(RemoteAction::Listen)
+                    } else {
+                        match args[2].as_str() {
+                            "listen" => Command::Remote(RemoteAction::Listen),
+                            "complete" => Command::Remote(RemoteAction::Complete),
+                            "cancel" => Command::Remote(RemoteAction::Cancel),
+                            "ping" => Command::Remote(RemoteAction::Ping),
+                            invalid => Command::Invalid(format!("remote {invalid}")),
+                        }
+                    }
+                }
                 "auth" => Command::Auth,
                 "history" => Command::History,
                 "keywords" => Command::Keywords,
@@ -172,6 +207,28 @@ pub async fn run() -> Result<(), anyhow::Error> {
         };
     }
 
+    if let Command::Remote(action) = &command {
+        if matches!(
+            action,
+            RemoteAction::Complete | RemoteAction::Cancel | RemoteAction::Ping
+        ) {
+            let command = match action {
+                RemoteAction::Complete => remote::RemoteCommand::Complete,
+                RemoteAction::Cancel => remote::RemoteCommand::Cancel,
+                RemoteAction::Ping => remote::RemoteCommand::Ping,
+                RemoteAction::Listen => unreachable!(),
+            };
+
+            return match remote::send_command(command).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+        }
+    }
+
     if let Command::Invalid(cmd) = &command {
         eprintln!("Error: unknown command '{}'", cmd);
         eprintln!("Run 'ostt help' to see available commands.");
@@ -207,7 +264,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 }
             }
         }
-        Command::Record => commands::handle_record().await?,
+        Command::Record => commands::handle_record(commands::RecordingMode::Interactive).await?,
+        Command::Remote(RemoteAction::Listen) => {
+            commands::handle_record(commands::RecordingMode::Remote).await?
+        }
         Command::History => commands::handle_history().await?,
         Command::Keywords => commands::handle_keywords().await?,
         Command::Config => commands::handle_config()?,
@@ -215,6 +275,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
         Command::Version => unreachable!(),
         Command::ListDevices => unreachable!(),
         Command::Logs => unreachable!(),
+        Command::Remote(_) => unreachable!(),
         Command::Invalid(_) => unreachable!(),
     }
 

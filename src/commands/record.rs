@@ -6,18 +6,51 @@
 use crate::clipboard::copy_to_clipboard;
 use crate::config;
 use crate::history::HistoryManager;
+use crate::remote;
 use crate::recording::{AudioRecorder, OsttTui, RecordingCommand};
 use crate::transcription;
 use crate::transcription::TranscriptionAnimation;
 use crate::ui::ErrorScreen;
 use dirs;
 use std::fs;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingMode {
+    Interactive,
+    Remote,
+}
+
+struct RemoteSocketGuard {
+    path: Option<PathBuf>,
+}
+
+impl RemoteSocketGuard {
+    fn new() -> Self {
+        Self { path: None }
+    }
+
+    fn set(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+}
+
+impl Drop for RemoteSocketGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            remote::cleanup_socket(path);
+        }
+    }
+}
 
 /// Handles audio recording and optional transcription.
 ///
 /// Records audio with real-time waveform visualization, optionally transcribes the recording,
-/// and saves to history. Supports external triggers via SIGUSR1 signal.
-pub async fn handle_record() -> Result<(), anyhow::Error> {
+/// and saves to history. Supports external triggers via SIGUSR1 signal and remote IPC.
+pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
     tracing::info!("=== ostt Audio Recorder Started ===");
 
     let config_data = match config::OsttConfig::load() {
@@ -43,7 +76,30 @@ pub async fn handle_record() -> Result<(), anyhow::Error> {
         config_data.audio.reference_level_db
     );
 
-    let mut audio_recorder = AudioRecorder::new(config_data.audio.sample_rate, config_data.audio.device.clone());
+    let mut remote_rx = None;
+    let mut remote_socket_guard = RemoteSocketGuard::new();
+    if mode == RecordingMode::Remote {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        match remote::start_listener(tx).await {
+            Ok(path) => {
+                tracing::info!("Remote control listening on {}", path.display());
+                remote_rx = Some(rx);
+                remote_socket_guard.set(path);
+            }
+            Err(err) => {
+                tracing::error!("Failed to start remote listener: {err}");
+                let mut error_screen = ErrorScreen::new()?;
+                error_screen.show_error(&format!(
+                    "Remote Control Error:\n\n{err}\n\nClose any running ostt remote instance and try again."
+                ))?;
+                error_screen.cleanup()?;
+                return Err(anyhow::anyhow!("Remote listener error: {err}"));
+            }
+        }
+    }
+
+    let mut audio_recorder =
+        AudioRecorder::new(config_data.audio.sample_rate, config_data.audio.device.clone());
 
     if let Err(e) = audio_recorder.start_recording() {
         tracing::error!("Failed to start recording: {}", e);
@@ -76,8 +132,25 @@ pub async fn handle_record() -> Result<(), anyhow::Error> {
     );
     let mut frame_count = 0u64;
     let mut should_transcribe = false;
+    let mut typing_error = None;
 
-    loop {
+    'recording: loop {
+        if let Some(rx) = remote_rx.as_mut() {
+            if let Ok(signal) = rx.try_recv() {
+                match signal {
+                    remote::RemoteSignal::Complete => {
+                        tracing::info!("Received remote completion command");
+                        should_transcribe = true;
+                        break 'recording;
+                    }
+                    remote::RemoteSignal::Cancel => {
+                        tracing::info!("Received remote cancel command");
+                        break 'recording;
+                    }
+                }
+            }
+        }
+
         if term.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::info!("Received SIGUSR1: transcribing via external trigger");
             should_transcribe = true;
@@ -150,15 +223,27 @@ pub async fn handle_record() -> Result<(), anyhow::Error> {
         let filepath_str = filepath.to_string_lossy().to_string();
         match resolve_transcription_config(&config_data) {
             Ok(Some(transcription_config)) => {
-                if let Err(e) = transcribe_recording_with_animation(
+                match transcribe_recording_with_animation(
                     &mut tui,
                     transcription_config,
                     &filepath_str,
                 )
                 .await
                 {
-                    tracing::warn!("Transcription failed: {}", e);
-                    eprintln!("Warning: Transcription failed: {e}");
+                    Ok(text) => {
+                        if mode == RecordingMode::Remote {
+                            if let Err(err) =
+                                type_transcription_with_feedback(&mut tui, &text).await
+                            {
+                                tracing::warn!("Typing failed: {}", err);
+                                typing_error = Some(err);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Transcription failed: {}", e);
+                        eprintln!("Warning: Transcription failed: {e}");
+                    }
                 }
             }
             Ok(None) => {
@@ -180,6 +265,16 @@ pub async fn handle_record() -> Result<(), anyhow::Error> {
                 error_screen.cleanup()?;
             }
         }
+    }
+
+    if let Some(err) = typing_error {
+        tui.cleanup().ok();
+        let mut error_screen = ErrorScreen::new()?;
+        error_screen.show_error(&format!(
+            "Error: Failed to type transcription.\n\n{err}"
+        ))?;
+        error_screen.cleanup()?;
+        return Err(err);
     }
 
     tui.cleanup()
@@ -303,7 +398,7 @@ async fn transcribe_recording_with_animation(
     tui: &mut OsttTui,
     transcription_config: transcription::TranscriptionConfig,
     audio_filename: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     tracing::debug!(
         "Starting transcription with model '{}' for file '{}'",
         transcription_config.model_label(),
@@ -353,7 +448,7 @@ async fn transcribe_recording_with_animation(
                 }
             }
 
-            Ok(())
+            Ok(text)
         }
         Ok(Err(e)) => {
             tracing::error!("Transcription failed: {}", e);
@@ -372,4 +467,82 @@ async fn transcribe_recording_with_animation(
             Err(anyhow::anyhow!("Transcription task failed: {e}"))
         }
     }
+}
+
+async fn type_transcription_with_feedback(
+    tui: &mut OsttTui,
+    text: &str,
+) -> anyhow::Result<()> {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let delay_ms = read_type_delay_ms();
+    let start_delay_ms = read_type_start_delay_ms();
+
+    tui.render_typing_progress(text, 0)
+        .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    let ydotool_bin = ydotool_bin();
+    let mut child = tokio::process::Command::new(ydotool_bin)
+        .args(["type", "--file", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to start ydotool: {e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open ydotool stdin"))?;
+
+    if start_delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(start_delay_ms)).await;
+    }
+
+    for (idx, ch) in chars.iter().enumerate() {
+        let mut buf = [0u8; 4];
+        let slice = ch.encode_utf8(&mut buf);
+        stdin.write_all(slice.as_bytes()).await?;
+        stdin.flush().await?;
+        tui.render_typing_progress(text, idx + 1)
+            .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    drop(stdin);
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("ydotool exited with status {status}"));
+    }
+
+    Ok(())
+}
+
+fn read_type_delay_ms() -> u64 {
+    std::env::var("OSTT_REMOTE_TYPE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(8)
+}
+
+fn read_type_start_delay_ms() -> u64 {
+    std::env::var("OSTT_REMOTE_TYPE_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
+fn ydotool_bin() -> String {
+    std::env::var("OSTT_YDOTOOL_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ydotool".to_string())
 }

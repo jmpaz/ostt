@@ -21,7 +21,7 @@ pub mod list_devices;
 pub mod logs;
 
 pub use auth::handle_auth;
-pub use record::handle_record;
+pub use record::{handle_record, RecordingMode};
 pub use history::handle_history;
 pub use keywords::handle_keywords;
 pub use config::handle_config;
