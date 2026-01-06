@@ -22,6 +22,78 @@ use crate::transcription::TranscriptionAnimation;
 
 use super::visualizations::{SpectrumAnalyzer, update_waveform, resize_waveform};
 
+#[derive(Debug, Clone, Copy)]
+struct RgbColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl RgbColor {
+    fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    fn to_color(self) -> Color {
+        Color::Rgb(self.r, self.g, self.b)
+    }
+
+    fn lerp(self, other: Self, t: f32) -> Self {
+        let clamp = |value: f32| value.clamp(0.0, 255.0).round() as u8;
+        Self {
+            r: clamp(self.r as f32 + (other.r as f32 - self.r as f32) * t),
+            g: clamp(self.g as f32 + (other.g as f32 - self.g as f32) * t),
+            b: clamp(self.b as f32 + (other.b as f32 - self.b as f32) * t),
+        }
+    }
+
+    fn greyed(self, mix: f32) -> Self {
+        let gray_value = ((self.r as u16 + self.g as u16 + self.b as u16) / 3) as u8;
+        let gray = Self::new(gray_value, gray_value, gray_value);
+        self.lerp(gray, mix.clamp(0.0, 1.0))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaveformColors {
+    top_fg: RgbColor,
+    top_bg: RgbColor,
+    bottom_fg: RgbColor,
+    bottom_bg: RgbColor,
+    footer_fg: RgbColor,
+    footer_bg: RgbColor,
+    border_fg: RgbColor,
+}
+
+impl WaveformColors {
+    fn base() -> Self {
+        Self {
+            top_fg: RgbColor::new(206, 224, 220),
+            top_bg: RgbColor::new(0, 0, 0),
+            bottom_fg: RgbColor::new(0, 0, 0),
+            bottom_bg: RgbColor::new(185, 207, 212),
+            footer_fg: RgbColor::new(185, 207, 212),
+            footer_bg: RgbColor::new(0, 0, 0),
+            border_fg: RgbColor::new(80, 90, 95),
+        }
+    }
+
+    fn cancel_target() -> Self {
+        let base = Self::base();
+        let neutral = RgbColor::new(120, 130, 135);
+        Self {
+            top_fg: neutral,
+            top_bg: base.top_bg,
+            bottom_fg: neutral,
+            bottom_bg: base.bottom_bg,
+            footer_fg: base.footer_fg.greyed(0.6),
+            footer_bg: base.footer_bg,
+            border_fg: base.border_fg.greyed(0.4),
+        }
+    }
+
+}
+
 /// User input command during recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingCommand {
@@ -62,6 +134,12 @@ pub struct OsttTui {
     visualization_type: VisualizationType,
     /// Spectrum analyzer (used when visualization_type is Spectrum)
     spectrum_analyzer: Option<SpectrumAnalyzer>,
+    /// Cancel animation start time
+    cancel_animation_start: Option<std::time::Instant>,
+    /// Cancel animation duration
+    cancel_animation_duration: std::time::Duration,
+    /// Snapshot of recording duration when cancel begins
+    cancel_duration_snapshot: Option<std::time::Duration>,
 }
 
 impl OsttTui {
@@ -116,6 +194,9 @@ impl OsttTui {
             pause_start_time: None,
             visualization_type,
             spectrum_analyzer,
+            cancel_animation_start: None,
+            cancel_animation_duration: std::time::Duration::from_millis(320),
+            cancel_duration_snapshot: None,
         })
     }
 
@@ -124,9 +205,40 @@ impl OsttTui {
     /// # Errors
     /// - If terminal rendering fails
     pub fn render_waveform(&mut self, samples: &[i16]) -> Result<(), Box<dyn Error>> {
-        let current_volume = self.calculate_volume(samples);
+        let cancel_progress = self.cancel_progress().unwrap_or(0.0).clamp(0.0, 1.0);
+        let cancel_active = cancel_progress > 0.0;
+        let current_volume = if cancel_active {
+            self.last_peak
+        } else {
+            self.calculate_volume(samples)
+        };
+        let base_colors = WaveformColors::base();
+        let target_colors = WaveformColors::cancel_target();
+        let waveform_colors = if cancel_progress > 0.0 {
+            let eased = 1.0 - (1.0 - cancel_progress).powf(2.0);
+            let cancel_wave_color =
+                base_colors
+                    .top_fg
+                    .lerp(target_colors.bottom_fg, eased);
+            WaveformColors {
+                top_fg: cancel_wave_color,
+                bottom_fg: cancel_wave_color,
+                top_bg: base_colors.top_bg,
+                bottom_bg: base_colors.bottom_bg,
+                footer_fg: base_colors.footer_fg,
+                footer_bg: base_colors.footer_bg,
+                border_fg: base_colors.border_fg,
+            }
+        } else {
+            base_colors
+        };
+        let footer_colors = base_colors;
+        let footer_inactive_color = Color::Rgb(120, 130, 135);
 
-        if !self.is_paused && self.last_sample_time.elapsed() >= self.sample_interval {
+        if !self.is_paused
+            && !cancel_active
+            && self.last_sample_time.elapsed() >= self.sample_interval
+        {
             match self.visualization_type {
                 VisualizationType::Spectrum => {
                     if let Some(analyzer) = &mut self.spectrum_analyzer {
@@ -161,12 +273,35 @@ impl OsttTui {
             }
         }
 
+        let inverted_data: Vec<u64> = self
+            .display_data
+            .iter()
+            .map(|&v| 100_u64.saturating_sub(v))
+            .collect();
+        let render_data;
+        let top_data = if cancel_active {
+            let scale = (1.0 - cancel_progress).clamp(0.0, 1.0);
+            render_data = self
+                .display_data
+                .iter()
+                .map(|&v| ((v as f32) * scale).round().clamp(0.0, 100.0) as u64)
+                .collect::<Vec<_>>();
+            &render_data
+        } else {
+            &self.display_data
+        };
+
         // Pre-calculate values to avoid borrow checker issues in closure
         let is_paused = self.is_paused;
         let peak_hold = self.peak_hold;
         let last_peak = self.last_peak;
         let peak_volume_threshold = self.peak_volume_threshold;
-        let recording_duration = self.get_recording_duration();
+        let recording_duration = if cancel_active {
+            self.cancel_duration_snapshot
+                .unwrap_or_else(|| self.get_recording_duration())
+        } else {
+            self.get_recording_duration()
+        };
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -181,6 +316,7 @@ impl OsttTui {
             };
 
             let top_area_height = content_area.height / 3 * 2;
+            let bottom_area_height = content_area.height.saturating_sub(top_area_height);
 
             let top_area = Rect {
                 x: content_area.x,
@@ -189,37 +325,96 @@ impl OsttTui {
                 height: top_area_height,
             };
 
-            let top_sparkline = Sparkline::default()
-                .data(&self.display_data)
-                .max(100)
-                .style(
-                    Style::default()
-                        .bg(Color::Rgb(0, 0, 0))
-                        .fg(Color::Rgb(206, 224, 220)),
-                );
-
-            frame.render_widget(top_sparkline, top_area);
-
             let bottom_area = Rect {
                 x: content_area.x,
                 y: content_area.y + top_area_height,
                 width: content_area.width,
-                height: content_area.height.saturating_sub(top_area_height),
+                height: bottom_area_height,
             };
 
-            let inverted_data: Vec<u64> = self
-                .display_data
-                .iter()
-                .map(|&v| 100_u64.saturating_sub(v))
-                .collect();
+            if cancel_active {
+                for y in top_area.y..top_area.y + top_area.height {
+                    for x in top_area.x..top_area.x + top_area.width {
+                        frame.buffer_mut().set_string(
+                            x,
+                            y,
+                            " ",
+                            Style::default().bg(base_colors.top_bg.to_color()),
+                        );
+                    }
+                }
 
-            let bottom_sparkline = Sparkline::default().data(&inverted_data).max(100).style(
-                Style::default()
-                    .bg(Color::Rgb(185, 207, 212))
-                    .fg(Color::Rgb(0, 0, 0)),
-            );
+                for y in bottom_area.y..bottom_area.y + bottom_area.height {
+                    for x in bottom_area.x..bottom_area.x + bottom_area.width {
+                        frame.buffer_mut().set_string(
+                            x,
+                            y,
+                            " ",
+                            Style::default().bg(base_colors.top_bg.to_color()),
+                        );
+                    }
+                }
 
-            frame.render_widget(bottom_sparkline, bottom_area);
+                let top_style = Style::default()
+                    .fg(waveform_colors.top_fg.to_color())
+                    .bg(base_colors.top_bg.to_color());
+                let bottom_style = Style::default()
+                    .fg(waveform_colors.bottom_fg.to_color())
+                    .bg(base_colors.top_bg.to_color());
+
+                let center_y = bottom_area.y;
+                let top_max = top_area.height as f32;
+                let bottom_max = bottom_area.height as f32;
+
+                for (idx, value) in top_data.iter().enumerate() {
+                    let x = match u16::try_from(idx) {
+                        Ok(col) => content_area.x + col,
+                        Err(_) => break,
+                    };
+                    if x >= content_area.x + content_area.width {
+                        break;
+                    }
+
+                    let normalized = (*value as f32 / 100.0).clamp(0.0, 1.0);
+                    let top_height = (normalized * top_max).round() as i16;
+                    let bottom_height = (normalized * bottom_max).round() as i16;
+
+                    for step in 0..top_height {
+                        let y = center_y.saturating_sub(1 + step as u16);
+                        frame.buffer_mut().set_string(x, y, "█", top_style);
+                    }
+
+                    for step in 0..bottom_height {
+                        let y = center_y + step as u16;
+                        if y >= bottom_area.y + bottom_area.height {
+                            break;
+                        }
+                        frame.buffer_mut().set_string(x, y, "█", bottom_style);
+                    }
+                }
+            } else {
+                let top_sparkline = Sparkline::default()
+                    .data(top_data)
+                    .max(100)
+                    .style(
+                        Style::default()
+                            .bg(base_colors.top_bg.to_color())
+                            .fg(waveform_colors.top_fg.to_color()),
+                    );
+
+                frame.render_widget(top_sparkline, top_area);
+
+                let bottom_sparkline = Sparkline::default()
+                    .data(&inverted_data)
+                    .max(100)
+                    .style(
+                        Style::default()
+                            .bg(base_colors.bottom_bg.to_color())
+                            .fg(waveform_colors.bottom_fg.to_color()),
+                    );
+
+                frame.render_widget(bottom_sparkline, bottom_area);
+            }
 
             let footer_area = Rect {
                 x: area.x,
@@ -235,7 +430,9 @@ impl OsttTui {
                 (peak_hold, last_peak)
             };
 
-            let peak_style = if display_peak >= peak_volume_threshold {
+            let peak_style = if cancel_active {
+                Style::default().fg(footer_inactive_color)
+            } else if display_peak >= peak_volume_threshold {
                 Style::default()
                     .bg(Color::Red)
                     .fg(Color::Rgb(255, 255, 255))
@@ -255,23 +452,30 @@ impl OsttTui {
             // Show pause symbol instead of red dot when paused
             let indicator = if is_paused {
                 ratatui::text::Span::styled("⏸ ", Style::default().fg(Color::Yellow))
+            } else if cancel_active {
+                ratatui::text::Span::styled("● ", Style::default().fg(footer_inactive_color))
             } else {
                 ratatui::text::Span::styled("● ", Style::default().fg(Color::Red))
             };
 
+            let text_style = if cancel_active {
+                Style::default().fg(footer_inactive_color)
+            } else {
+                Style::default().fg(footer_colors.footer_fg.to_color())
+            };
             let help_text = ratatui::text::Line::from(vec![
                 indicator,
-                duration_span,
-                ratatui::text::Span::raw(" / "),
-                vol_span,
-                ratatui::text::Span::raw(" / "),
+                ratatui::text::Span::styled(duration_span.content.clone(), text_style),
+                ratatui::text::Span::styled(" / ", text_style),
+                ratatui::text::Span::styled(vol_span.content.clone(), text_style),
+                ratatui::text::Span::styled(" / ", text_style),
                 peak_span,
             ]);
 
             let footer = ratatui::widgets::Paragraph::new(help_text).style(
                 Style::default()
-                    .fg(Color::Rgb(185, 207, 212))
-                    .bg(Color::Rgb(0, 0, 0)),
+                    .fg(footer_colors.footer_fg.to_color())
+                    .bg(footer_colors.footer_bg.to_color()),
             );
 
             frame.render_widget(footer, footer_area);
@@ -541,6 +745,26 @@ impl OsttTui {
         )?;
         self.terminal.show_cursor()?;
         Ok(())
+    }
+
+    /// Starts the cancel animation, transitioning the waveform to a red palette.
+    pub fn start_cancel_animation(&mut self) {
+        if self.cancel_animation_start.is_none() {
+            self.cancel_animation_start = Some(std::time::Instant::now());
+            self.cancel_duration_snapshot = Some(self.get_recording_duration());
+        }
+    }
+
+    /// Returns true if the cancel animation has finished.
+    pub fn cancel_animation_done(&self) -> bool {
+        self.cancel_progress().is_some_and(|progress| progress >= 1.0)
+    }
+
+    fn cancel_progress(&self) -> Option<f32> {
+        let start = self.cancel_animation_start?;
+        let elapsed = start.elapsed().as_secs_f32();
+        let total = self.cancel_animation_duration.as_secs_f32().max(0.001);
+        Some((elapsed / total).min(1.0))
     }
 }
 

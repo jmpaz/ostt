@@ -134,8 +134,23 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
     let mut should_transcribe = false;
     let mut typing_error = None;
     let mut remote_output_override = None;
+    let mut cancel_pending = false;
 
     'recording: loop {
+        if cancel_pending {
+            if let Ok(RecordingCommand::Cancel) = tui.handle_input() {
+                break 'recording;
+            }
+
+            let samples = audio_recorder.get_samples();
+            tui.render_waveform(&samples)
+                .map_err(|e| anyhow::anyhow!("Render failed: {e}"))?;
+            if tui.cancel_animation_done() {
+                break 'recording;
+            }
+            continue;
+        }
+
         if let Some(rx) = remote_rx.as_mut() {
             if let Ok(signal) = rx.try_recv() {
                 match signal {
@@ -147,7 +162,9 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
                     }
                     remote::RemoteSignal::Cancel => {
                         tracing::info!("Received remote cancel command");
-                        break 'recording;
+                        tui.start_cancel_animation();
+                        cancel_pending = true;
+                        continue;
                     }
                 }
             }
@@ -177,7 +194,9 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
                 break;
             }
             Ok(RecordingCommand::Cancel) => {
-                break;
+                tui.start_cancel_animation();
+                cancel_pending = true;
+                continue;
             }
             Ok(RecordingCommand::TogglePause) => {
                 audio_recorder.toggle_pause();
