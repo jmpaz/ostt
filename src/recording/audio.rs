@@ -4,13 +4,13 @@
 //! format conversion using ffmpeg. Audio is captured from the system's default
 //! input device, converted to mono, and saved in the requested format.
 
+use super::ffmpeg::find_ffmpeg;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::WavWriter;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use super::ffmpeg::find_ffmpeg;
 
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
@@ -72,8 +72,7 @@ impl AudioRecorder {
             let host = cpal::default_host();
 
             if self.device_name == "default" {
-                host.default_input_device()
-                    .ok_or_else(|| anyhow!("No audio input device available"))
+                resolve_default_input_device(&host)
             } else {
                 // Try to find device by name or index
                 find_device_by_name(&host, &self.device_name)
@@ -375,6 +374,18 @@ impl AudioRecorder {
     }
 }
 
+fn resolve_default_input_device(host: &cpal::Host) -> Result<cpal::Device> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(device) = resolve_linux_session_default_input_device(host)? {
+            return Ok(device);
+        }
+    }
+
+    host.default_input_device()
+        .ok_or_else(|| anyhow!("No audio input device available"))
+}
+
 /// Finds an audio input device by name or numeric index.
 ///
 /// # Arguments
@@ -383,10 +394,7 @@ impl AudioRecorder {
 ///
 /// # Errors
 /// - If no device with the specified name/index is found
-fn find_device_by_name(
-    host: &cpal::Host,
-    device_spec: &str,
-) -> Result<cpal::Device> {
+fn find_device_by_name(host: &cpal::Host, device_spec: &str) -> Result<cpal::Device> {
     // Try to parse as a numeric index first
     if let Ok(index) = device_spec.parse::<usize>() {
         let devices: Vec<_> = host
@@ -422,6 +430,207 @@ fn find_device_by_name(
         "Audio input device '{}' not found. Use 'ostt list-devices' to see available devices.",
         device_spec
     ))
+}
+
+fn find_device_by_partial_name(host: &cpal::Host, needle: &str) -> Result<Option<cpal::Device>> {
+    let needle_lower = needle.to_lowercase();
+    if needle_lower.is_empty() {
+        return Ok(None);
+    }
+
+    let devices = host
+        .input_devices()
+        .map_err(|e| anyhow!("Failed to enumerate devices: {e}"))?;
+
+    let mut best_match: Option<(u8, cpal::Device, String)> = None;
+
+    for device in devices {
+        let Ok(name) = device.name() else {
+            continue;
+        };
+
+        let name_lower = name.to_lowercase();
+        let score = if name_lower == needle_lower {
+            4
+        } else if name_lower.starts_with(&needle_lower) || needle_lower.starts_with(&name_lower) {
+            3
+        } else if name_lower.contains(&needle_lower) || needle_lower.contains(&name_lower) {
+            2
+        } else {
+            0
+        };
+
+        if score == 0 {
+            continue;
+        }
+
+        let should_replace = best_match
+            .as_ref()
+            .map(|(best_score, _, _)| score > *best_score)
+            .unwrap_or(true);
+
+        if should_replace {
+            best_match = Some((score, device, name));
+        }
+    }
+
+    if let Some((_, device, matched_name)) = best_match {
+        tracing::info!(
+            "Matched requested input '{}' to available device '{}'",
+            needle,
+            matched_name
+        );
+        return Ok(Some(device));
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_session_default_input_device(host: &cpal::Host) -> Result<Option<cpal::Device>> {
+    if let Some(source_name) = linux_default_source_name_from_wpctl() {
+        if let Some(device) = find_device_by_partial_name(host, &source_name)? {
+            tracing::info!(
+                "Using Linux session default input source from wpctl: '{}'",
+                source_name
+            );
+            return Ok(Some(device));
+        }
+    }
+
+    if let Some((node_name, description)) = linux_default_source_from_pactl() {
+        let mut hints = Vec::new();
+
+        if let Some(desc) = description {
+            hints.push(strip_pulse_profile_suffix(&desc));
+        }
+
+        hints.push(node_name_to_hint(&node_name));
+
+        for hint in hints {
+            if hint.is_empty() {
+                continue;
+            }
+
+            if let Some(device) = find_device_by_partial_name(host, &hint)? {
+                tracing::info!(
+                    "Using Linux session default input source from pactl: '{}'",
+                    hint
+                );
+                return Ok(Some(device));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_source_name_from_wpctl() -> Option<String> {
+    let output = command_stdout("wpctl", &["inspect", "@DEFAULT_AUDIO_SOURCE@"])?;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some((_, value)) = trimmed.split_once("node.nick = \"") {
+            return value.strip_suffix('"').map(|s| s.to_string());
+        }
+        if let Some((_, value)) = trimmed.split_once("node.description = \"") {
+            return value.strip_suffix('"').map(strip_pulse_profile_suffix);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_source_from_pactl() -> Option<(String, Option<String>)> {
+    let info = command_stdout("pactl", &["info"])?;
+    let default_source = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Default Source: "))
+        .map(str::trim)?
+        .to_string();
+
+    let sources = command_stdout("pactl", &["list", "sources"])?;
+    let mut current_name: Option<String> = None;
+    let mut description: Option<String> = None;
+
+    for line in sources.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Source #") {
+            if current_name.as_deref() == Some(default_source.as_str()) {
+                return Some((default_source, description));
+            }
+            current_name = None;
+            description = None;
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Name: ") {
+            current_name = Some(value.trim().to_string());
+            continue;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("Description: ") {
+            if current_name.as_deref() == Some(default_source.as_str()) {
+                description = Some(value.trim().to_string());
+            }
+        }
+    }
+
+    Some((default_source, description))
+}
+
+#[cfg(target_os = "linux")]
+fn strip_pulse_profile_suffix(label: &str) -> String {
+    const SUFFIXES: &[&str] = &[
+        " Analog Stereo",
+        " Analog Mono",
+        " Digital Stereo",
+        " Stereo",
+        " Mono",
+    ];
+
+    let trimmed = label.trim();
+    for suffix in SUFFIXES {
+        if let Some(base) = trimmed.strip_suffix(suffix) {
+            return base.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn node_name_to_hint(node_name: &str) -> String {
+    let after_prefix = node_name.strip_prefix("alsa_input.").unwrap_or(node_name);
+    let core = after_prefix.split('.').next().unwrap_or(after_prefix);
+    let core = core.strip_prefix("usb-").unwrap_or(core);
+
+    let mut parts: Vec<&str> = core.split('_').collect();
+    if let Some(last) = parts.last() {
+        if last
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c.is_ascii_digit() || c == '-')
+        {
+            parts.pop();
+        }
+    }
+
+    parts
+        .join(" ")
+        .replace('-', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "linux")]
+fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 /// Temporarily redirects stderr to /dev/null to suppress ALSA library warnings on Linux.
