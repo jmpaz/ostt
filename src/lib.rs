@@ -4,13 +4,9 @@
 //!
 //! ostt allows you to:
 //! - Record audio with real-time waveform visualization and volume metering
-//! - Automatically transcribe recordings using multiple AI providers and models
+//! - Transcribe recordings by shelling out to `contextualize`
 //! - Maintain a searchable history of all transcriptions
-//! - Configure and authenticate with any supported transcription provider
-//! - Select from available models for each provider
-//!
-//! Built with Rust for performance and minimal dependencies, ostt provides a command-line
-//! interface for recording, provider authentication, model selection, and history browsing.
+//! - Keep recent recordings available during the cache window
 
 pub mod app;
 pub mod clipboard;
@@ -19,10 +15,9 @@ pub mod config;
 pub mod history;
 pub mod keywords;
 pub mod logging;
-pub mod remote;
 pub mod recording;
+pub mod remote;
 pub mod setup;
-pub mod transcription;
 pub mod ui;
 
 pub use app::run;

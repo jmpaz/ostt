@@ -18,9 +18,9 @@ use std::error::Error;
 use std::io::{stdout, Stdout};
 
 use crate::config::VisualizationType;
-use crate::transcription::TranscriptionAnimation;
 
-use super::visualizations::{SpectrumAnalyzer, update_waveform, resize_waveform};
+use super::visualizations::{resize_waveform, update_waveform, SpectrumAnalyzer};
+use super::TranscriptionAnimation;
 
 #[derive(Debug, Clone, Copy)]
 struct RgbColor {
@@ -91,7 +91,6 @@ impl WaveformColors {
             border_fg: base.border_fg.greyed(0.4),
         }
     }
-
 }
 
 /// User input command during recording.
@@ -216,10 +215,7 @@ impl OsttTui {
         let target_colors = WaveformColors::cancel_target();
         let waveform_colors = if cancel_progress > 0.0 {
             let eased = 1.0 - (1.0 - cancel_progress).powf(2.0);
-            let cancel_wave_color =
-                base_colors
-                    .top_fg
-                    .lerp(target_colors.bottom_fg, eased);
+            let cancel_wave_color = base_colors.top_fg.lerp(target_colors.bottom_fg, eased);
             WaveformColors {
                 top_fg: cancel_wave_color,
                 bottom_fg: cancel_wave_color,
@@ -250,7 +246,7 @@ impl OsttTui {
                     update_waveform(&mut self.display_data, current_volume, self.terminal_width);
                 }
             }
-            
+
             self.last_sample_time = std::time::Instant::now();
         }
 
@@ -259,11 +255,16 @@ impl OsttTui {
 
         if current_width != self.terminal_width {
             self.terminal_width = current_width;
-            
+
             match self.visualization_type {
                 VisualizationType::Spectrum => {
                     if let Some(analyzer) = &mut self.spectrum_analyzer {
-                        analyzer.resize(current_width, samples, self.sample_rate, self.reference_level_db);
+                        analyzer.resize(
+                            current_width,
+                            samples,
+                            self.sample_rate,
+                            self.reference_level_db,
+                        );
                         self.display_data = analyzer.data().to_vec();
                     }
                 }
@@ -393,25 +394,19 @@ impl OsttTui {
                     }
                 }
             } else {
-                let top_sparkline = Sparkline::default()
-                    .data(top_data)
-                    .max(100)
-                    .style(
-                        Style::default()
-                            .bg(base_colors.top_bg.to_color())
-                            .fg(waveform_colors.top_fg.to_color()),
-                    );
+                let top_sparkline = Sparkline::default().data(top_data).max(100).style(
+                    Style::default()
+                        .bg(base_colors.top_bg.to_color())
+                        .fg(waveform_colors.top_fg.to_color()),
+                );
 
                 frame.render_widget(top_sparkline, top_area);
 
-                let bottom_sparkline = Sparkline::default()
-                    .data(&inverted_data)
-                    .max(100)
-                    .style(
-                        Style::default()
-                            .bg(base_colors.bottom_bg.to_color())
-                            .fg(waveform_colors.bottom_fg.to_color()),
-                    );
+                let bottom_sparkline = Sparkline::default().data(&inverted_data).max(100).style(
+                    Style::default()
+                        .bg(base_colors.bottom_bg.to_color())
+                        .fg(waveform_colors.bottom_fg.to_color()),
+                );
 
                 frame.render_widget(bottom_sparkline, bottom_area);
             }
@@ -645,9 +640,12 @@ impl OsttTui {
 
             for y in area.y..area.y + area.height {
                 for x in area.x..area.x + area.width {
-                    frame
-                        .buffer_mut()
-                        .set_string(x, y, " ", Style::default().bg(Color::Rgb(0, 0, 0)));
+                    frame.buffer_mut().set_string(
+                        x,
+                        y,
+                        " ",
+                        Style::default().bg(Color::Rgb(0, 0, 0)),
+                    );
                 }
             }
 
@@ -757,7 +755,8 @@ impl OsttTui {
 
     /// Returns true if the cancel animation has finished.
     pub fn cancel_animation_done(&self) -> bool {
-        self.cancel_progress().is_some_and(|progress| progress >= 1.0)
+        self.cancel_progress()
+            .is_some_and(|progress| progress >= 1.0)
     }
 
     fn cancel_progress(&self) -> Option<f32> {
@@ -790,7 +789,11 @@ fn build_typing_lines(
     let ranges = wrap_text_ranges(&chars, max_width);
     let total_lines = ranges.len().max(1);
 
-    let cursor_index = if typed < chars.len() { Some(typed) } else { None };
+    let cursor_index = if typed < chars.len() {
+        Some(typed)
+    } else {
+        None
+    };
     let mut cursor_line = total_lines.saturating_sub(1);
     if let Some(cursor) = cursor_index {
         for (idx, (start, end)) in ranges.iter().enumerate() {

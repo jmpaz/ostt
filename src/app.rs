@@ -27,8 +27,6 @@ enum Command {
     Record,
     /// Record audio with remote IPC control
     Remote(RemoteAction),
-    /// Authenticate with a transcription provider and select model
-    Auth,
     /// View transcription history
     History,
     /// Manage keywords for transcription
@@ -61,7 +59,7 @@ const HELP_TEXT: &str = r#"
 ┗┛┛┗┗
 
 A terminal-based speech-to-text recorder with real-time waveform visualization
-and automatic transcription support.
+and contextualize-driven transcription.
 
 USAGE:
     ostt [COMMAND]
@@ -78,18 +76,14 @@ COMMANDS:
     remote cancel       Send cancel command to running remote instance
     remote ping         Check if remote instance socket is available
 
-    auth                Authenticate with a transcription provider and
-                        select a model. Handles both provider selection
-                        and API key management in one unified flow.
-
     history             View and browse your transcription history
                         Select a transcription to copy it to clipboard
 
     keywords            Manage keywords for improved transcription accuracy
-                        Add, remove, and view keywords used by AI models
+                        Add, remove, and view keyword hints passed to contextualize
 
     config              Open configuration file in your preferred editor
-                        Customize audio settings and provider options
+                        Customize audio settings
 
     version, -V, --version
                         Show version information
@@ -107,9 +101,6 @@ EXAMPLES:
     # Remote-controlled recording
     $ ostt remote
 
-    # Set up authentication and select a model
-    $ ostt auth
-    
     # View your transcription history
     $ ostt history
     
@@ -162,7 +153,6 @@ impl Command {
                         }
                     }
                 }
-                "auth" => Command::Auth,
                 "history" => Command::History,
                 "keywords" => Command::Keywords,
                 "config" => Command::Config,
@@ -188,7 +178,7 @@ impl Command {
 /// # Errors
 /// - If setup fails
 /// - If logging initialization fails
-/// - If command execution fails (e.g., authentication, recording, history viewing)
+/// - If command execution fails (e.g., recording or history viewing)
 pub async fn run() -> Result<(), anyhow::Error> {
     let command = Command::from_args();
 
@@ -267,18 +257,6 @@ pub async fn run() -> Result<(), anyhow::Error> {
     }
 
     match command {
-        Command::Auth => {
-            if let Err(e) = commands::handle_auth().await {
-                // Check if it's a cancellation error (cliclack already displayed the message)
-                let err_msg = e.to_string();
-                if err_msg.contains("cancelled") || err_msg.contains("interrupted") {
-                    // Silent exit - cliclack already showed "Operation cancelled"
-                    process::exit(0);
-                } else {
-                    return Err(e);
-                }
-            }
-        }
         Command::Record => commands::handle_record(commands::RecordingMode::Interactive).await?,
         Command::Remote(RemoteAction::Listen) => {
             commands::handle_record(commands::RecordingMode::Remote).await?

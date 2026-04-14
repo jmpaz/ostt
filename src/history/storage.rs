@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// A single transcription entry in the history.
@@ -37,6 +38,7 @@ impl HistoryManager {
     /// # Errors
     /// - If the data directory cannot be accessed
     pub fn new(data_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(data_dir)?;
         let database_path = data_dir.join("transcription_history.db");
 
         Ok(Self {

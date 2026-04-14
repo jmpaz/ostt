@@ -5,9 +5,11 @@
 
 pub mod audio;
 pub mod ffmpeg;
+pub mod transcription_animation;
 pub mod ui;
 pub mod visualizations;
 
 pub use audio::AudioRecorder;
 pub use ffmpeg::find_ffmpeg;
-pub use ui::{RecordingCommand, OsttTui};
+pub use transcription_animation::TranscriptionAnimation;
+pub use ui::{OsttTui, RecordingCommand};

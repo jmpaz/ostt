@@ -1,6 +1,6 @@
 # OSTT - Open Speech-to-Text
 
-**OSTT** is an interactive terminal-based audio recording and speech-to-text transcription tool. Record audio with real-time waveform visualization, automatically transcribe using multiple AI providers and models, and maintain a browsable history of all your transcriptions. Built with Rust for performance and minimal dependencies, ostt works seamlessly on **Linux and macOS**.
+**OSTT** is an interactive terminal-based audio recording and speech-to-text transcription tool. Record audio with real-time waveform visualization, hand the finished file to `contextualize` for transcription, and maintain a browsable history of all your transcriptions. Built with Rust for performance and minimal dependencies, ostt works seamlessly on **Linux and macOS**.
 
 > [!TIP]
 > **Omarchy and Hyprland users!** Configure ostt to run as a floating popup window to record and transcribe in any app. 
@@ -16,34 +16,18 @@
 - **dBFS-based volume metering** (industry standard)
 - **Configurable reference level** for clipping detection
 - **Audio clipping detection** with pause/resume support
-- **Audio compression** for fast API calls
-- **Multiple transcription providers and models**
+- **Audio compression** for fast transcription handoff
+- **Simple contextualize integration**
+- **7-day rolling recording cache**
 - **Browsable transcription history**
 - **Keyword management** for improved accuracy
 - **Cross-platform support** - Linux and macOS
 
-## Supported Providers & Models
+## Transcription Pipeline
 
-ostt supports multiple AI transcription providers. Bring your own API key and choose from the following:
+ostt records audio locally, stores the encoded file in `~/.local/share/ostt/cache/recordings/`, and invokes `contextualize` on that file when you stop recording. The recording cache is pruned to a 7-day rolling window.
 
-### OpenAI
-- **gpt-4o-transcribe** - Latest model with best accuracy
-- **gpt-4o-mini-transcribe** - Faster, lighter model
-- **whisper-1** - Legacy Whisper model
-
-### Deepgram
-- **nova-3** - Latest generation, fastest processing
-- **nova-2** - Previous generation model
-
-### DeepInfra
-- **deepinfra-whisper-large-v3** - High accuracy Whisper model
-- **deepinfra-whisper-base** - Fast, lightweight model
-
-### Groq
-- **groq-whisper-large-v3** - High accuracy processing
-- **groq-whisper-large-v3-turbo** - Fastest transcription speed
-
-Configure your preferred provider and model using `ostt auth`.
+Install `contextualize` somewhere on your `PATH` before using transcription.
 
 ## Installation
 
@@ -87,16 +71,16 @@ ffmpeg wl-clipboard  # For Wayland
 ffmpeg xclip         # For X11
 ```
 
+**Transcription command:**
+```bash
+contextualize
+```
+
 ## Quick Start
 
-After installation, set up authentication and start recording:
-
-**Authentication:** ostt is a bring-your-own-API-key application. Authenticate once with your preferred provider, then freely switch between available models.
+After installation, make sure `contextualize` is installed and start recording:
 
 ```bash
-# Configure your transcription provider
-ostt auth
-
 # Start recording (press Enter to transcribe, Esc to cancel)
 ostt record
 
@@ -128,7 +112,6 @@ ostt works on all Linux distributions and macOS without additional setup. Simply
 
 ```bash
 ostt record          # Record audio with real-time visualization
-ostt auth            # Configure transcription provider and API key
 ostt history         # Browse transcription history
 ostt keywords        # Manage keywords for improved accuracy
 ostt config          # Open configuration file in editor
@@ -183,19 +166,7 @@ visualization = "spectrum"      # "spectrum" (default) or "waveform"
 
 ### Transcription Setup
 
-Configure your AI provider:
-
-```bash
-ostt auth
-```
-
-This will:
-- Show available providers and models
-- Let you select your preferred model
-- Prompt for your API key
-- Save everything securely
-
-**Security Note:** API keys are stored separately in `~/.local/share/ostt/credentials` with restricted permissions (0600).
+Install `contextualize` and keep it available on `PATH`. ostt passes `keywords.txt` to `contextualize` with `--transcribe-prompt-file` when that file exists.
 
 ### Example Configuration
 
@@ -207,11 +178,6 @@ peak_volume_threshold = 90
 reference_level_db = -20
 output_format = "mp3 -ab 16k -ar 12000"
 visualization = "spectrum"  # "spectrum" for frequency display, "waveform" for amplitude display
-
-[providers.deepgram]
-punctuate = true
-smart_format = false
-filler_words = false
 ```
 
 For detailed configuration options, see the config file comments or run `ostt config` to edit.
@@ -271,7 +237,8 @@ Add technical terms, names, or domain-specific vocabulary to help the AI transcr
     └── alacritty-float.toml
 
 ~/.local/share/ostt/
-└── credentials            # API keys (0600 permissions)
+└── cache/
+    └── recordings/        # Encoded recordings retained for 7 days
 
 ~/.local/state/ostt/
 └── ostt.log.*             # Daily-rotated logs
@@ -312,8 +279,8 @@ The reference level may be set too high/low for your audio card. Run ostt, maxim
 ### Transcription Not Working
 
 ```bash
-# Verify authentication
-ostt auth
+# Verify contextualize is installed
+contextualize --help
 
 # Check logs with debug output
 RUST_LOG=debug ostt record
@@ -357,7 +324,6 @@ ostt/
 │   ├── commands/         # Command handlers
 │   ├── config/           # Configuration management
 │   ├── recording/        # Audio capture and UI
-│   ├── transcription/    # API integrations
 │   ├── history/          # History storage and UI
 │   └── ui/               # Shared UI components
 ├── environments/         # Platform-specific integrations

@@ -1,22 +1,20 @@
-//! Audio recording and transcription.
-//!
-//! Handles audio recording with real-time waveform visualization, optional transcription,
-//! and history management. Supports external triggers via SIGUSR1 signal.
-
 use crate::clipboard::copy_to_clipboard;
 use crate::config;
 use crate::history::HistoryManager;
+use crate::recording::{AudioRecorder, OsttTui, RecordingCommand, TranscriptionAnimation};
 use crate::remote;
-use crate::recording::{AudioRecorder, OsttTui, RecordingCommand};
-use crate::transcription;
-use crate::transcription::TranscriptionAnimation;
 use crate::ui::ErrorScreen;
-use dirs;
+use chrono::Utc;
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
+
+const CONTEXTUALIZE_BIN: &str = "contextualize";
+const CONTEXTUALIZE_CACHE_TTL: &str = "7d";
+const RECORDING_CACHE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {
@@ -46,10 +44,6 @@ impl Drop for RemoteSocketGuard {
     }
 }
 
-/// Handles audio recording and optional transcription.
-///
-/// Records audio with real-time waveform visualization, optionally transcribes the recording,
-/// and saves to history. Supports external triggers via SIGUSR1 signal and remote IPC.
 pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
     tracing::info!("=== ostt Audio Recorder Started ===");
 
@@ -98,19 +92,21 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
         }
     }
 
-    let mut audio_recorder =
-        AudioRecorder::new(config_data.audio.sample_rate, config_data.audio.device.clone());
+    let mut audio_recorder = AudioRecorder::new(
+        config_data.audio.sample_rate,
+        config_data.audio.device.clone(),
+    );
 
-    if let Err(e) = audio_recorder.start_recording() {
-        tracing::error!("Failed to start recording: {}", e);
+    if let Err(err) = audio_recorder.start_recording() {
+        tracing::error!("Failed to start recording: {}", err);
         let error_message = format!(
             "Recording Error:\n\n{}\n\nPlease check your audio configuration and try again.",
-            e
+            err
         );
         let mut error_screen = ErrorScreen::new()?;
         error_screen.show_error(&error_message)?;
         error_screen.cleanup()?;
-        return Err(e);
+        return Err(err);
     }
 
     let actual_sample_rate = audio_recorder.get_sample_rate();
@@ -120,12 +116,12 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
         config_data.audio.reference_level_db,
         config_data.audio.visualization,
     )
-    .map_err(|e| anyhow::anyhow!("Failed to initialize UI: {e}"))?;
+    .map_err(|err| anyhow::anyhow!("Failed to initialize UI: {err}"))?;
 
     let term = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let term_clone = term.clone();
     signal_hook::flag::register(signal_hook::consts::SIGUSR1, term_clone)
-        .map_err(|e| anyhow::anyhow!("Failed to register signal handler: {e}"))?;
+        .map_err(|err| anyhow::anyhow!("Failed to register signal handler: {err}"))?;
 
     tracing::debug!(
         "Entering recording loop. Press 'Enter' to transcribe or 'Escape'/'q' to cancel."
@@ -144,7 +140,7 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
 
             let samples = audio_recorder.get_samples();
             tui.render_waveform(&samples)
-                .map_err(|e| anyhow::anyhow!("Render failed: {e}"))?;
+                .map_err(|err| anyhow::anyhow!("Render failed: {err}"))?;
             if tui.cancel_animation_done() {
                 break 'recording;
             }
@@ -187,7 +183,7 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
 
                 let samples = audio_recorder.get_samples();
                 tui.render_waveform(&samples)
-                    .map_err(|e| anyhow::anyhow!("Render failed: {e}"))?;
+                    .map_err(|err| anyhow::anyhow!("Render failed: {err}"))?;
             }
             Ok(RecordingCommand::Transcribe) => {
                 should_transcribe = true;
@@ -203,91 +199,48 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
                 tui.is_paused = audio_recorder.is_paused();
                 let samples = audio_recorder.get_samples();
                 tui.render_waveform(&samples)
-                    .map_err(|e| anyhow::anyhow!("Render failed: {e}"))?;
+                    .map_err(|err| anyhow::anyhow!("Render failed: {err}"))?;
             }
-            Err(e) => {
-                tracing::error!("Input handling error: {}", e);
-                return Err(anyhow::anyhow!("Input handling error: {e}"));
+            Err(err) => {
+                tracing::error!("Input handling error: {}", err);
+                return Err(anyhow::anyhow!("Input handling error: {err}"));
             }
         }
     }
 
     tracing::debug!("Stopping recording and saving audio...");
-    let codec = config_data
-        .audio
-        .output_format
-        .split_whitespace()
-        .next()
-        .unwrap_or("mp3");
-    let extension = match codec {
-        "libopus" => "ogg",
-        "libvorbis" => "ogg",
-        "flac" => "flac",
-        "aac" => "m4a",
-        "pcm_s16le" => "wav",
-        _ => codec,
-    };
-
-    // Save to temp directory with ostt-recording prefix
-    let temp_dir = std::env::temp_dir();
-    let filename = format!("ostt-recording.{extension}");
-    let filepath = temp_dir.join(&filename);
+    let extension = recording_extension(&config_data.audio.output_format);
+    let recordings_dir = recordings_cache_dir()?;
+    prune_recording_cache(
+        &recordings_dir,
+        SystemTime::now(),
+        RECORDING_CACHE_RETENTION,
+    );
+    let filepath = recordings_dir.join(recording_cache_filename(extension));
 
     audio_recorder
         .stop_recording(Some(filepath.clone()), &config_data.audio.output_format)
-        .map_err(|e| {
-            tracing::error!("Failed to save recording: {}", e);
-            e
+        .map_err(|err| {
+            tracing::error!("Failed to save recording: {}", err);
+            err
         })?;
 
     if should_transcribe {
-        let filepath_str = filepath.to_string_lossy().to_string();
-        match resolve_transcription_config(&config_data) {
-            Ok(Some(transcription_config)) => {
-                match transcribe_recording_with_animation(
-                    &mut tui,
-                    transcription_config,
-                    &filepath_str,
-                )
-                .await
-                {
-                    Ok(text) => {
-                        if mode == RecordingMode::Remote {
-                            if let Err(err) = output_transcription_with_feedback(
-                                &mut tui,
-                                &text,
-                                remote_output_override,
-                            )
+        match transcribe_recording_with_animation(&mut tui, &filepath).await {
+            Ok(text) => {
+                if mode == RecordingMode::Remote {
+                    if let Err(err) =
+                        output_transcription_with_feedback(&mut tui, &text, remote_output_override)
                             .await
-                            {
-                                tracing::warn!("Remote output failed: {}", err);
-                                typing_error = Some(err);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Transcription failed: {}", e);
-                        eprintln!("Warning: Transcription failed: {e}");
+                    {
+                        tracing::warn!("Remote output failed: {}", err);
+                        typing_error = Some(err);
                     }
                 }
             }
-            Ok(None) => {
-                tracing::debug!("No transcription model configured");
-                tui.cleanup().ok();
-                let mut error_screen = ErrorScreen::new()?;
-                error_screen.show_error(
-                    "Error: No transcription model configured.\n\nSet OSTT_TRANSCRIPTION_MODEL (and OSTT_TRANSCRIPTION_API_KEY) or run 'ostt auth'.",
-                )?;
-                error_screen.cleanup()?;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to resolve transcription settings: {}", e);
-                tui.cleanup().ok();
-                let mut error_screen = ErrorScreen::new()?;
-                error_screen.show_error(&format!(
-                    "Error: Failed to configure transcription.\n\n{e}"
-                ))?;
-                error_screen.cleanup()?;
+            Err(err) => {
+                tracing::warn!("Transcription failed: {}", err);
+                eprintln!("Warning: Transcription failed: {err}");
             }
         }
     }
@@ -295,203 +248,247 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
     if let Some(err) = typing_error {
         tui.cleanup().ok();
         let mut error_screen = ErrorScreen::new()?;
-        error_screen.show_error(&format!(
-            "Error: Failed to type transcription.\n\n{err}"
-        ))?;
+        error_screen.show_error(&format!("Error: Failed to type transcription.\n\n{err}"))?;
         error_screen.cleanup()?;
         return Err(err);
     }
 
     tui.cleanup()
-        .map_err(|e| anyhow::anyhow!("Cleanup failed: {e}"))?;
+        .map_err(|err| anyhow::anyhow!("Cleanup failed: {err}"))?;
 
     tracing::info!("=== ostt Audio Recorder Exited Successfully ===");
     Ok(())
 }
 
-fn resolve_transcription_config(
-    config_data: &config::OsttConfig,
-) -> anyhow::Result<Option<transcription::TranscriptionConfig>> {
-    let overrides = config::load_transcription_overrides(config_data);
-    let using_override = overrides.is_configured();
-    let selected_model_id = config::get_selected_model().ok().flatten();
-
-    let model_value = match overrides.model.clone().or(selected_model_id) {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-
-    let provider_override = match overrides.provider.as_deref() {
-        Some(raw) => Some(parse_provider_override(raw)?),
-        None => None,
-    };
-
-    let (model, api_model_name_override, provider) =
-        match transcription::TranscriptionModel::from_id(&model_value) {
-            Some(model) => {
-                if let Some(provider_override) = provider_override {
-                    if provider_override != model.provider() {
-                        return Err(anyhow::anyhow!(
-                            "Override provider '{}' does not match model '{}'.",
-                            provider_override.id(),
-                            model_value
-                        ));
-                    }
-                }
-                let provider = model.provider();
-                (model, None, provider)
-            }
-            None => {
-                let provider = provider_override.unwrap_or_else(|| {
-                    tracing::debug!(
-                        "No provider override set for custom model '{}'; defaulting to OpenAI-compatible API.",
-                        model_value
-                    );
-                    transcription::TranscriptionProvider::OpenAI
-                });
-                let model = transcription::TranscriptionModel::default_for_provider(&provider);
-                (model, Some(model_value), provider)
-            }
-        };
-
-    let api_key = if using_override {
-        overrides.api_key.unwrap_or_default()
-    } else {
-        match config::get_api_key(provider.id())? {
-            Some(key) => key,
-            None => {
-                return Err(anyhow::anyhow!(
-                    "No API key for {}. Set OSTT_TRANSCRIPTION_API_KEY or run 'ostt auth'.",
-                    provider.name()
-                ));
-            }
-        }
-    };
-
-    let keywords = load_keywords()?;
-
-    Ok(Some(transcription::TranscriptionConfig::new_with_overrides(
-        model,
-        api_key,
-        keywords,
-        config_data.providers.clone(),
-        api_model_name_override,
-        overrides.endpoint,
-        using_override,
-    )))
+fn ostt_data_dir() -> anyhow::Result<PathBuf> {
+    let data_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+        .join(".local")
+        .join("share")
+        .join("ostt");
+    fs::create_dir_all(&data_dir)?;
+    Ok(data_dir)
 }
 
-fn parse_provider_override(raw: &str) -> anyhow::Result<transcription::TranscriptionProvider> {
-    let normalized = raw.trim().to_lowercase();
-    transcription::TranscriptionProvider::from_id(&normalized).ok_or_else(|| {
-        let providers = transcription::TranscriptionProvider::all()
-            .iter()
-            .map(|provider| provider.id())
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::anyhow!(
-            "Unknown transcription provider '{}'. Expected one of: {}.",
-            raw,
-            providers
-        )
-    })
-}
-
-fn load_keywords() -> anyhow::Result<Vec<String>> {
-    let config_dir = dirs::home_dir()
+fn keywords_file() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
         .join(".config")
-        .join("ostt");
-    let keywords_file = config_dir.join("keywords.txt");
-    if keywords_file.exists() {
-        let content = fs::read_to_string(&keywords_file)?;
-        Ok(content
-            .lines()
-            .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty())
-            .collect())
-    } else {
-        Ok(Vec::new())
+        .join("ostt")
+        .join("keywords.txt"))
+}
+
+fn recordings_cache_dir() -> anyhow::Result<PathBuf> {
+    let cache_dir = ostt_data_dir()?.join("cache").join("recordings");
+    fs::create_dir_all(&cache_dir)?;
+    Ok(cache_dir)
+}
+
+fn recording_extension(output_format: &str) -> &str {
+    match output_format.split_whitespace().next().unwrap_or("mp3") {
+        "libopus" | "libvorbis" => "ogg",
+        "flac" => "flac",
+        "aac" => "m4a",
+        "pcm_s16le" => "wav",
+        codec => codec,
     }
 }
 
-/// Transcribes an audio recording with animated progress indicator.
-///
-/// # Errors
-/// - If transcription fails
+fn recording_cache_filename(extension: &str) -> String {
+    let now = Utc::now();
+    format!(
+        "{}-{}-{:03}.{}",
+        now.format("%Y%m%dT%H%M%SZ"),
+        std::process::id(),
+        now.timestamp_subsec_millis(),
+        extension
+    )
+}
+
+fn prune_recording_cache(dir: &Path, now: SystemTime, retention: Duration) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::debug!("Skipping recording cache prune: {}", err);
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age <= retention {
+            continue;
+        }
+
+        if let Err(err) = fs::remove_file(&path) {
+            tracing::debug!(
+                "Failed to remove expired recording cache entry {}: {}",
+                path.display(),
+                err
+            );
+        }
+    }
+}
+
+fn build_contextualize_args(audio_path: &Path, keywords_path: Option<&Path>) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("--quiet"),
+        OsString::from("cat"),
+        OsString::from("-f"),
+        OsString::from("raw"),
+        OsString::from("--cache-ttl"),
+        OsString::from(CONTEXTUALIZE_CACHE_TTL),
+    ];
+
+    if let Some(path) = keywords_path {
+        args.push(OsString::from("--transcribe-prompt-file"));
+        args.push(path.as_os_str().to_os_string());
+    }
+
+    args.push(audio_path.as_os_str().to_os_string());
+    args
+}
+
 async fn transcribe_recording_with_animation(
     tui: &mut OsttTui,
-    transcription_config: transcription::TranscriptionConfig,
-    audio_filename: &str,
+    audio_path: &Path,
 ) -> anyhow::Result<String> {
+    if !audio_path.exists() {
+        return Err(anyhow::anyhow!("No audio was captured."));
+    }
+
     tracing::debug!(
-        "Starting transcription with model '{}' for file '{}'",
-        transcription_config.model_label(),
-        audio_filename
+        "Starting contextualize transcription for file '{}'",
+        audio_path.display()
     );
 
-    let mut animation = TranscriptionAnimation::new(80);
+    let keywords_path = keywords_file()?;
+    let args = build_contextualize_args(
+        audio_path,
+        keywords_path.exists().then_some(keywords_path.as_path()),
+    );
+    let mut animation = TranscriptionAnimation::new();
 
-    let filename = audio_filename.to_string();
-    let transcription_handle = tokio::spawn(async move {
-        transcription::transcribe(&transcription_config, filename.as_ref()).await
-    });
+    let transcription_handle =
+        tokio::spawn(async move { run_transcription_command(CONTEXTUALIZE_BIN, &args).await });
 
     loop {
-        if let Err(e) = tui.render_transcription_animation(&mut animation) {
-            tracing::warn!("Failed to render animation: {}", e);
+        if let Err(err) = tui.render_transcription_animation(&mut animation) {
+            tracing::warn!("Failed to render animation: {}", err);
         }
 
         if transcription_handle.is_finished() {
             break;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     match transcription_handle.await {
         Ok(Ok(text)) => {
             tracing::info!("Transcription completed: {}", text);
 
-            let data_dir = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-                .join(".local")
-                .join("share")
-                .join("ostt");
-
-            let mut history_manager = HistoryManager::new(&data_dir)?;
-            if let Err(e) = history_manager.save_transcription(&text) {
-                tracing::warn!("Failed to save transcription to history: {}", e);
+            let mut history_manager = HistoryManager::new(&ostt_data_dir()?)?;
+            if let Err(err) = history_manager.save_transcription(&text) {
+                tracing::warn!("Failed to save transcription to history: {}", err);
             }
 
-            match copy_to_clipboard(&text) {
-                Ok(_) => {
-                    tracing::debug!("Transcribed text copied to clipboard");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to copy to clipboard: {}", e);
-                }
+            if let Err(err) = copy_to_clipboard(&text) {
+                tracing::warn!("Failed to copy to clipboard: {}", err);
+            } else {
+                tracing::debug!("Transcribed text copied to clipboard");
             }
 
             Ok(text)
         }
-        Ok(Err(e)) => {
-            tracing::error!("Transcription failed: {}", e);
+        Ok(Err(err)) => {
+            tracing::error!("Transcription failed: {}", err);
             tui.cleanup().ok();
             let mut error_screen = ErrorScreen::new()?;
-            error_screen.show_error(&format!("Error: Transcription failed - {e}"))?;
+            error_screen.show_error(&format!("Error: Transcription failed - {err}"))?;
             error_screen.cleanup()?;
-            Err(e)
+            Err(err)
         }
-        Err(e) => {
-            tracing::error!("Transcription task failed: {}", e);
+        Err(err) => {
+            tracing::error!("Transcription task failed: {}", err);
             tui.cleanup().ok();
             let mut error_screen = ErrorScreen::new()?;
-            error_screen.show_error(&format!("Error: Transcription task failed - {e}"))?;
+            error_screen.show_error(&format!("Error: Transcription task failed - {err}"))?;
             error_screen.cleanup()?;
-            Err(anyhow::anyhow!("Transcription task failed: {e}"))
+            Err(anyhow::anyhow!("Transcription task failed: {err}"))
         }
     }
+}
+
+async fn run_transcription_command(program: &str, args: &[OsString]) -> anyhow::Result<String> {
+    tracing::debug!("Running transcription command: {} {:?}", program, args);
+
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "Could not find '{}' on PATH. Install contextualize before recording.",
+                    program
+                )
+            } else {
+                anyhow::anyhow!("Failed to run '{}': {}", program, err)
+            }
+        })?;
+
+    parse_transcription_output(program, &output.stdout, &output.stderr, output.status)
+}
+
+fn parse_transcription_output(
+    program: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+    status: ExitStatus,
+) -> anyhow::Result<String> {
+    let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+    if !status.success() {
+        if stderr_text.is_empty() {
+            return Err(anyhow::anyhow!("{} exited with status {}", program, status));
+        }
+        return Err(anyhow::anyhow!("{} failed: {}", program, stderr_text));
+    }
+
+    let stdout_text = String::from_utf8(stdout.to_vec())
+        .map_err(|err| anyhow::anyhow!("{} returned invalid UTF-8 on stdout: {}", program, err))?;
+    let transcript = stdout_text.trim().to_string();
+    if transcript.is_empty() {
+        if stderr_text.is_empty() {
+            return Err(anyhow::anyhow!("{} returned no transcript.", program));
+        }
+        return Err(anyhow::anyhow!(
+            "{} returned no transcript. {}",
+            program,
+            stderr_text
+        ));
+    }
+
+    Ok(transcript)
 }
 
 async fn output_transcription_with_feedback(
@@ -525,7 +522,7 @@ async fn type_transcription_with_feedback(
     let start_delay_ms = read_type_start_delay_ms();
 
     tui.render_typing_progress(text, 0, header_label)
-        .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+        .map_err(|err| anyhow::anyhow!("Typing UI error: {err}"))?;
 
     if total == 0 {
         return Ok(());
@@ -538,7 +535,7 @@ async fn type_transcription_with_feedback(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to start ydotool: {e}"))?;
+        .map_err(|err| anyhow::anyhow!("Failed to start ydotool: {err}"))?;
 
     let mut stdin = child
         .stdin
@@ -555,7 +552,7 @@ async fn type_transcription_with_feedback(
         stdin.write_all(slice.as_bytes()).await?;
         stdin.flush().await?;
         tui.render_typing_progress(text, idx + 1, header_label)
-            .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+            .map_err(|err| anyhow::anyhow!("Typing UI error: {err}"))?;
 
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -579,7 +576,7 @@ async fn stream_transcription_preview(
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     tui.render_typing_progress(text, 0, header_label)
-        .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+        .map_err(|err| anyhow::anyhow!("Typing UI error: {err}"))?;
 
     if total == 0 {
         return Ok(());
@@ -594,13 +591,13 @@ async fn stream_transcription_preview(
     for _ in 0..frames {
         typed = (typed + step).min(total);
         tui.render_typing_progress(text, typed, header_label)
-            .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+            .map_err(|err| anyhow::anyhow!("Typing UI error: {err}"))?;
         tokio::time::sleep(Duration::from_millis(frame_ms)).await;
     }
 
     if typed < total {
         tui.render_typing_progress(text, total, header_label)
-            .map_err(|e| anyhow::anyhow!("Typing UI error: {e}"))?;
+            .map_err(|err| anyhow::anyhow!("Typing UI error: {err}"))?;
     }
 
     Ok(())
@@ -615,7 +612,7 @@ async fn send_paste_shortcut() -> anyhow::Result<()> {
             .stderr(Stdio::null())
             .status()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to run ydotool: {e}"))?;
+            .map_err(|err| anyhow::anyhow!("Failed to run ydotool: {err}"))?;
         if !status.success() {
             return Err(anyhow::anyhow!("ydotool exited with status {status}"));
         }
@@ -633,7 +630,7 @@ async fn send_paste_shortcut() -> anyhow::Result<()> {
             .stderr(Stdio::null())
             .status()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to run osascript: {e}"))?;
+            .map_err(|err| anyhow::anyhow!("Failed to run osascript: {err}"))?;
         if !status.success() {
             return Err(anyhow::anyhow!("osascript exited with status {status}"));
         }
@@ -655,8 +652,7 @@ fn resolve_output_mode(
 }
 
 fn read_output_mode() -> remote::RemoteOutputMode {
-    let raw = std::env::var("OSTT_REMOTE_OUTPUT_MODE")
-        .unwrap_or_else(|_| "paste".to_string());
+    let raw = std::env::var("OSTT_REMOTE_OUTPUT_MODE").unwrap_or_else(|_| "paste".to_string());
     match raw.trim().to_ascii_lowercase().as_str() {
         "type" | "typed" | "manual" => remote::RemoteOutputMode::Type,
         _ => remote::RemoteOutputMode::Paste,
@@ -710,4 +706,150 @@ fn ydotool_bin() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "ydotool".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_contextualize_args, prune_recording_cache, run_transcription_command,
+        CONTEXTUALIZE_CACHE_TTL, RECORDING_CACHE_RETENTION,
+    };
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn stringify(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ostt-{}-{}-{}",
+            label,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| Duration::from_secs(0))
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_contextualize_args_includes_keywords_file() {
+        let args = build_contextualize_args(
+            Path::new("/tmp/audio.mp3"),
+            Some(Path::new("/tmp/keywords.txt")),
+        );
+
+        assert_eq!(
+            stringify(&args),
+            vec![
+                "--quiet",
+                "cat",
+                "-f",
+                "raw",
+                "--cache-ttl",
+                CONTEXTUALIZE_CACHE_TTL,
+                "--transcribe-prompt-file",
+                "/tmp/keywords.txt",
+                "/tmp/audio.mp3",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_contextualize_args_omits_keywords_file() {
+        let args = build_contextualize_args(Path::new("/tmp/audio.mp3"), None);
+
+        assert_eq!(
+            stringify(&args),
+            vec![
+                "--quiet",
+                "cat",
+                "-f",
+                "raw",
+                "--cache-ttl",
+                CONTEXTUALIZE_CACHE_TTL,
+                "/tmp/audio.mp3",
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_recording_cache_removes_only_expired_files() {
+        let dir = temp_dir("cache-prune");
+        let stale = dir.join("stale.mp3");
+        let fresh = dir.join("fresh.mp3");
+
+        fs::write(&stale, "old").unwrap();
+        let stale_modified = fs::metadata(&stale).unwrap().modified().unwrap();
+        fs::write(&fresh, "new").unwrap();
+        let mut fresh_modified = fs::metadata(&fresh).unwrap().modified().unwrap();
+        while fresh_modified
+            .duration_since(stale_modified)
+            .map(|delta| delta.is_zero())
+            .unwrap_or(true)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+            fs::write(&fresh, "newer").unwrap();
+            fresh_modified = fs::metadata(&fresh).unwrap().modified().unwrap();
+        }
+        let spacing = fresh_modified.duration_since(stale_modified).unwrap();
+        let now = stale_modified + RECORDING_CACHE_RETENTION + spacing / 2;
+
+        prune_recording_cache(&dir, now, RECORDING_CACHE_RETENTION);
+
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_transcription_command_returns_trimmed_stdout() {
+        let args = vec![
+            OsString::from("-c"),
+            OsString::from("printf ' hello world \\n'"),
+        ];
+
+        let transcript = run_transcription_command("sh", &args).await.unwrap();
+
+        assert_eq!(transcript, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_transcription_command_rejects_empty_stdout() {
+        let args = vec![OsString::from("-c"), OsString::from("printf ''")];
+        let err = run_transcription_command("sh", &args).await.unwrap_err();
+
+        assert!(err.to_string().contains("returned no transcript"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_transcription_command_uses_stderr_on_failure() {
+        let args = vec![
+            OsString::from("-c"),
+            OsString::from("printf 'boom' >&2; exit 3"),
+        ];
+        let err = run_transcription_command("sh", &args).await.unwrap_err();
+
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn run_transcription_command_reports_missing_binary() {
+        let args: Vec<OsString> = Vec::new();
+        let err = run_transcription_command("ostt-binary-that-does-not-exist", &args)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Could not find"));
+    }
 }

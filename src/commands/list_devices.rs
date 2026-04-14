@@ -19,7 +19,7 @@ pub fn handle_list_devices() -> Result<(), anyhow::Error> {
         let device_iter = host
             .input_devices()
             .map_err(|e| anyhow!("Failed to enumerate audio devices: {e}"))?;
-        
+
         // Collect devices, skipping any that fail to query
         let devices: Vec<cpal::Device> = device_iter
             .filter_map(|d| {
@@ -30,7 +30,7 @@ pub fn handle_list_devices() -> Result<(), anyhow::Error> {
                 }
             })
             .collect();
-        
+
         Ok((host, devices))
     })?;
 
@@ -92,7 +92,7 @@ where
         .map_err(|e| anyhow!("Failed to open /dev/null: {e}"))?;
 
     let dev_null_fd = dev_null.as_raw_fd();
-    
+
     // Save the current stderr file descriptor
     let old_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
     if old_stderr == -1 {

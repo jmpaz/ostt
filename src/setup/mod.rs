@@ -42,7 +42,6 @@ pub fn run_setup() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 /// Sets up Hyprland-specific files.
 ///
 /// # Errors
@@ -85,4 +84,3 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
     std::fs::set_permissions(path, perms)?;
     Ok(())
 }
-

@@ -12,9 +12,6 @@ homepage = "https://github.com/kristoferlund/ostt"
 # Terminal UI
 ratatui = "0.29.0"
 crossterm = "0.28.1"
-cliclack = "0.3.0"
-console = "0.15.8"
-ctrlc = "3.5.1"
 tui-input = "0.14.0"
 
 # Audio capture and processing
@@ -39,10 +36,6 @@ tracing-subscriber = { version = "0.3.18", features = [
   "ansi",
 ] }
 tracing-appender = "0.2.3"
-
-# API calls for transcription
-reqwest = { version = "0.12.24", features = ["json", "multipart"] }
-urlencoding = "2.1.3"
 
 # Database for history
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
