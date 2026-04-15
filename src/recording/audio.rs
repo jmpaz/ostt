@@ -6,6 +6,7 @@
 
 use super::ffmpeg::find_ffmpeg;
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::WavWriter;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,40 @@ pub struct AudioRecorder {
     device_name: String,
 }
 
+pub struct RecordedAudio {
+    sample_rate: u32,
+    samples: Vec<i16>,
+}
+
+fn append_transcription_debug_log(message: impl AsRef<str>) {
+    let state_dir = if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+        PathBuf::from(xdg_state).join("ostt")
+    } else {
+        match dirs::home_dir() {
+            Some(home) => home.join(".local").join("state").join("ostt"),
+            None => return,
+        }
+    };
+
+    if std::fs::create_dir_all(&state_dir).is_err() {
+        return;
+    }
+
+    let path = state_dir.join("transcription-latest.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+
+    let _ = std::io::Write::write_all(
+        &mut file,
+        format!("{} {}\n", Utc::now().to_rfc3339(), message.as_ref()).as_bytes(),
+    );
+}
+
 impl AudioRecorder {
     /// Creates a new audio recorder with requested sample rate and device.
     ///
@@ -67,18 +102,39 @@ impl AudioRecorder {
     /// - If device configuration fails
     /// - If audio stream creation fails
     pub fn start_recording(&mut self) -> Result<()> {
-        // Get device while suppressing ALSA library warnings
-        let device = suppress_alsa_warnings(|| {
-            let host = cpal::default_host();
+        let host = cpal::default_host();
 
-            if self.device_name == "default" {
-                resolve_default_input_device(&host)
-            } else {
-                // Try to find device by name or index
-                find_device_by_name(&host, &self.device_name)
+        if self.device_name == "default" {
+            let candidates = suppress_alsa_warnings(|| resolve_default_input_devices(&host))?;
+            let mut failures = Vec::new();
+
+            for device in candidates {
+                let device_name = device
+                    .name()
+                    .unwrap_or_else(|_| "Unknown device".to_string());
+                match self.activate_device(device) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        append_transcription_debug_log(format!(
+                            "phase=device-open-failed device={} error={}",
+                            device_name, err
+                        ));
+                        failures.push(format!("{device_name}: {err}"));
+                    }
+                }
             }
-        })?;
 
+            return Err(anyhow!(
+                "Failed to open any default input device. Tried: {}",
+                failures.join(" | ")
+            ));
+        }
+
+        let device = suppress_alsa_warnings(|| find_device_by_name(&host, &self.device_name))?;
+        self.activate_device(device)
+    }
+
+    fn activate_device(&mut self, device: cpal::Device) -> Result<()> {
         let device_name = device
             .name()
             .unwrap_or_else(|_| "Unknown device".to_string());
@@ -88,7 +144,6 @@ impl AudioRecorder {
         let device_sample_rate = device_config.sample_rate().0;
         let num_channels = device_config.channels() as usize;
 
-        // Warn if requested sample rate doesn't match device
         if device_sample_rate != self.sample_rate {
             tracing::warn!(
                 "Requested sample rate {}Hz but device uses {}Hz. Recording at device rate.",
@@ -103,11 +158,9 @@ impl AudioRecorder {
             num_channels
         );
 
-        // Update to actual device parameters
         self.sample_rate = device_sample_rate;
         self.device_channels = num_channels;
 
-        // Set up audio callback with cloned Arc references
         let samples_arc = Arc::clone(&self.samples);
         let pause_arc = Arc::clone(&self.is_paused);
         let callback_channels = num_channels;
@@ -126,10 +179,10 @@ impl AudioRecorder {
             None,
         )?;
 
-        // Start playback and store stream
         stream.play()?;
         self.stream = Some(stream);
 
+        append_transcription_debug_log(format!("phase=device-opened device={}", device_name));
         tracing::debug!("Audio stream started");
         Ok(())
     }
@@ -148,6 +201,12 @@ impl AudioRecorder {
     /// - If temporary WAV creation fails
     /// - If ffmpeg conversion fails
     pub fn stop_recording(&mut self, output_path: Option<PathBuf>, format: &str) -> Result<()> {
+        let recording = self.finish_recording()?;
+        recording.save(output_path, format)
+    }
+
+    pub fn finish_recording(&mut self) -> Result<RecordedAudio> {
+        append_transcription_debug_log("phase=finish-recording-start");
         // Stop the audio stream
         self.stream = None;
 
@@ -156,7 +215,10 @@ impl AudioRecorder {
 
         if sample_count == 0 {
             tracing::warn!("Recording stopped with no samples captured");
-            return Ok(());
+            return Ok(RecordedAudio {
+                sample_rate: self.sample_rate,
+                samples,
+            });
         }
 
         // Calculate and log recording duration
@@ -168,29 +230,15 @@ impl AudioRecorder {
             self.sample_rate
         );
 
-        // Save and convert to desired format
-        if let Some(output_file) = output_path {
-            let temp_wav = self.create_temp_wav_path();
+        append_transcription_debug_log(format!(
+            "phase=finish-recording-done sample_rate={} sample_count={}",
+            self.sample_rate, sample_count
+        ));
 
-            self.save_wav(&samples, &temp_wav)?;
-            self.convert_with_ffmpeg(&temp_wav, &output_file, format)?;
-
-            // Clean up temporary file
-            if let Err(e) = std::fs::remove_file(&temp_wav) {
-                tracing::debug!("Failed to remove temp file: {}", e);
-            }
-
-            // Log final file info
-            let file_size = std::fs::metadata(&output_file)?.len();
-            tracing::info!(
-                "Audio saved: {} ({} bytes, format: {})",
-                output_file.display(),
-                file_size,
-                format
-            );
-        }
-
-        Ok(())
+        Ok(RecordedAudio {
+            sample_rate: self.sample_rate,
+            samples,
+        })
     }
 
     /// Handles incoming audio data from the audio callback.
@@ -226,93 +274,6 @@ impl AudioRecorder {
                 }
             }
         }
-    }
-
-    /// Saves audio samples as a temporary WAV file.
-    ///
-    /// This creates an uncompressed PCM WAV intermediate file that will be
-    /// converted to the desired format by ffmpeg.
-    fn save_wav(&self, samples: &[i16], path: &Path) -> Result<()> {
-        let wav_spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: self.sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-
-        let mut writer = WavWriter::create(path, wav_spec)?;
-
-        for &sample in samples {
-            writer.write_sample(sample)?;
-        }
-
-        writer.finalize()?;
-        tracing::debug!("Temporary WAV created: {}", path.display());
-        Ok(())
-    }
-
-    /// Converts audio using ffmpeg based on format string.
-    ///
-    /// # Arguments
-    /// * `input_wav` - Path to temporary WAV file
-    /// * `output_path` - Final output file path
-    /// * `format` - Format string: "codec [options]", e.g., "mp3 -ab 16k -ar 12000"
-    ///
-    /// The format string is parsed to extract the codec and any additional ffmpeg
-    /// arguments. Mono conversion is always enforced.
-    fn convert_with_ffmpeg(
-        &self,
-        input_wav: &Path,
-        output_path: &Path,
-        format: &str,
-    ) -> Result<()> {
-        // Parse codec and additional options from format string
-        let format_parts: Vec<&str> = format.split_whitespace().collect();
-
-        if format_parts.is_empty() {
-            return Err(anyhow!("Invalid format string: empty"));
-        }
-
-        let codec = format_parts[0];
-
-        // Find ffmpeg binary with cross-platform support
-        let ffmpeg_path = find_ffmpeg()?;
-
-        // Build ffmpeg command
-        let mut cmd = Command::new(&ffmpeg_path);
-        cmd.arg("-loglevel")
-            .arg("error")
-            .arg("-i")
-            .arg(input_wav)
-            .arg("-acodec")
-            .arg(codec)
-            .arg("-ac")
-            .arg("1") // Force mono
-            .arg("-y"); // Overwrite output
-
-        // Add any additional ffmpeg options from format string
-        for option in &format_parts[1..] {
-            cmd.arg(option);
-        }
-
-        cmd.arg(output_path);
-
-        // Execute ffmpeg
-        let output = cmd.output()?;
-
-        if output.status.success() {
-            tracing::debug!("Audio converted to {} format", codec);
-            Ok(())
-        } else {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
-            tracing::error!("ffmpeg conversion failed: {}", error_msg);
-            Err(anyhow!("Audio encoding failed: {error_msg}"))
-        }
-    }
-
-    /// Creates a path for the temporary WAV file.
-    fn create_temp_wav_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("ostt_{}.wav", std::process::id()))
     }
 
     // Getters for recorded data
@@ -361,6 +322,49 @@ impl AudioRecorder {
     }
 }
 
+impl RecordedAudio {
+    pub fn save(&self, output_path: Option<PathBuf>, format: &str) -> Result<()> {
+        if let Some(output_file) = output_path {
+            let temp_wav = create_temp_wav_path();
+
+            append_transcription_debug_log(format!(
+                "phase=save-wav-start temp_wav={} samples={}",
+                temp_wav.display(),
+                self.samples.len()
+            ));
+            save_wav(self.sample_rate, &self.samples, &temp_wav)?;
+            append_transcription_debug_log(format!(
+                "phase=save-wav-done temp_wav={}",
+                temp_wav.display()
+            ));
+            append_transcription_debug_log(format!(
+                "phase=ffmpeg-start output={} format={}",
+                output_file.display(),
+                format
+            ));
+            convert_with_ffmpeg(&temp_wav, &output_file, format)?;
+            append_transcription_debug_log(format!(
+                "phase=ffmpeg-done output={}",
+                output_file.display()
+            ));
+
+            if let Err(err) = std::fs::remove_file(&temp_wav) {
+                tracing::debug!("Failed to remove temp file: {}", err);
+            }
+
+            let file_size = std::fs::metadata(&output_file)?.len();
+            tracing::info!(
+                "Audio saved: {} ({} bytes, format: {})",
+                output_file.display(),
+                file_size,
+                format
+            );
+        }
+
+        Ok(())
+    }
+}
+
 // Maintain backward compatibility with existing API
 impl AudioRecorder {
     /// Deprecated: Use `samples()` instead.
@@ -374,16 +378,104 @@ impl AudioRecorder {
     }
 }
 
-fn resolve_default_input_device(host: &cpal::Host) -> Result<cpal::Device> {
+fn save_wav(sample_rate: u32, samples: &[i16], path: &Path) -> Result<()> {
+    let wav_spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut writer = WavWriter::create(path, wav_spec)?;
+
+    for &sample in samples {
+        writer.write_sample(sample)?;
+    }
+
+    writer.finalize()?;
+    tracing::debug!("Temporary WAV created: {}", path.display());
+    Ok(())
+}
+
+fn convert_with_ffmpeg(input_wav: &Path, output_path: &Path, format: &str) -> Result<()> {
+    let format_parts: Vec<&str> = format.split_whitespace().collect();
+
+    if format_parts.is_empty() {
+        return Err(anyhow!("Invalid format string: empty"));
+    }
+
+    let codec = format_parts[0];
+    let ffmpeg_path = find_ffmpeg()?;
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(input_wav)
+        .arg("-acodec")
+        .arg(codec)
+        .arg("-ac")
+        .arg("1")
+        .arg("-y");
+
+    for option in &format_parts[1..] {
+        cmd.arg(option);
+    }
+
+    cmd.arg(output_path);
+
+    let output = cmd.output()?;
+
+    if output.status.success() {
+        tracing::debug!("Audio converted to {} format", codec);
+        Ok(())
+    } else {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("ffmpeg conversion failed: {}", error_msg);
+        Err(anyhow!("Audio encoding failed: {error_msg}"))
+    }
+}
+
+fn create_temp_wav_path() -> PathBuf {
+    std::env::temp_dir().join(format!("ostt_{}.wav", std::process::id()))
+}
+
+fn resolve_default_input_devices(host: &cpal::Host) -> Result<Vec<cpal::Device>> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push_unique = |device: cpal::Device| {
+        let key = device
+            .name()
+            .unwrap_or_else(|_| format!("unknown-{}", seen.len()));
+        if seen.insert(key) {
+            candidates.push(device);
+        }
+    };
+
     #[cfg(target_os = "linux")]
     {
         if let Some(device) = resolve_linux_session_default_input_device(host)? {
-            return Ok(device);
+            push_unique(device);
         }
     }
 
-    host.default_input_device()
-        .ok_or_else(|| anyhow!("No audio input device available"))
+    if let Some(device) = host.default_input_device() {
+        push_unique(device);
+    }
+
+    let devices = host
+        .input_devices()
+        .map_err(|e| anyhow!("Failed to enumerate devices: {e}"))?;
+    for device in devices {
+        push_unique(device);
+    }
+
+    if candidates.is_empty() {
+        return Err(anyhow!("No audio input device available"));
+    }
+
+    Ok(candidates)
 }
 
 /// Finds an audio input device by name or numeric index.

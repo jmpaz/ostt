@@ -4,8 +4,8 @@
 //! locations before falling back to PATH search. This ensures ffmpeg can be found
 //! even when running in environments with limited PATH setup (e.g., iTerm commands).
 
-use std::path::PathBuf;
 use anyhow::{anyhow, Result};
+use std::path::PathBuf;
 
 /// Locates the ffmpeg binary on the system.
 ///
@@ -18,18 +18,28 @@ use anyhow::{anyhow, Result};
 /// # Returns
 /// The path to the ffmpeg binary, or an error if not found.
 pub fn find_ffmpeg() -> Result<PathBuf> {
+    if let Some(path) = ffmpeg_from_env() {
+        tracing::debug!("Found ffmpeg from OSTT_FFMPEG_BIN: {}", path.display());
+        return Ok(path);
+    }
+
+    if let Ok(path) = find_in_path("ffmpeg") {
+        tracing::debug!("Found ffmpeg in PATH at: {}", path.display());
+        return Ok(path);
+    }
+
     // Check common installation locations by platform
     let candidates = if cfg!(target_os = "macos") {
         vec![
-            PathBuf::from("/opt/homebrew/bin/ffmpeg"),      // Apple Silicon Homebrew
-            PathBuf::from("/usr/local/bin/ffmpeg"),         // Intel Homebrew or manual install
-            PathBuf::from("/usr/bin/ffmpeg"),               // Direct system install
+            PathBuf::from("/opt/homebrew/bin/ffmpeg"), // Apple Silicon Homebrew
+            PathBuf::from("/usr/local/bin/ffmpeg"),    // Intel Homebrew or manual install
+            PathBuf::from("/usr/bin/ffmpeg"),          // Direct system install
         ]
     } else if cfg!(target_os = "linux") {
         vec![
-            PathBuf::from("/usr/bin/ffmpeg"),               // Standard Linux
-            PathBuf::from("/usr/local/bin/ffmpeg"),         // Manual install
-            PathBuf::from("/snap/bin/ffmpeg"),              // Snap installation
+            PathBuf::from("/usr/bin/ffmpeg"),       // Standard Linux
+            PathBuf::from("/usr/local/bin/ffmpeg"), // Manual install
+            PathBuf::from("/snap/bin/ffmpeg"),      // Snap installation
         ]
     } else if cfg!(target_os = "windows") {
         vec![
@@ -49,10 +59,22 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
         }
     }
 
-    // Fall back to PATH search using system commands
-    let ffmpeg_path = find_in_path("ffmpeg")?;
-    tracing::debug!("Found ffmpeg in PATH at: {}", ffmpeg_path.display());
-    Ok(ffmpeg_path)
+    Err(anyhow!(
+        "ffmpeg not found. Please install ffmpeg:\n\
+         macOS: brew install ffmpeg\n\
+         Linux: apt install ffmpeg (Debian/Ubuntu) or dnf install ffmpeg (Fedora)\n\
+         Windows: Download from https://ffmpeg.org/download.html"
+    ))
+}
+
+fn ffmpeg_from_env() -> Option<PathBuf> {
+    let value = std::env::var("OSTT_FFMPEG_BIN").ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    path.exists().then_some(path)
 }
 
 /// Searches for a binary in the system PATH.
@@ -78,12 +100,7 @@ fn find_in_path(binary_name: &str) -> Result<PathBuf> {
         }
     }
 
-    Err(anyhow!(
-        "ffmpeg not found. Please install ffmpeg:\n\
-         macOS: brew install ffmpeg\n\
-         Linux: apt install ffmpeg (Debian/Ubuntu) or dnf install ffmpeg (Fedora)\n\
-         Windows: Download from https://ffmpeg.org/download.html"
-    ))
+    Err(anyhow!("ffmpeg not found on PATH"))
 }
 
 #[cfg(test)]

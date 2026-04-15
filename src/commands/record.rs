@@ -7,6 +7,7 @@ use crate::ui::ErrorScreen;
 use chrono::Utc;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
@@ -15,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 const CONTEXTUALIZE_BIN: &str = "contextualize";
 const CONTEXTUALIZE_CACHE_TTL: &str = "7d";
 const RECORDING_CACHE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DEFAULT_TRANSCRIPTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {
@@ -218,15 +220,15 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
     );
     let filepath = recordings_dir.join(recording_cache_filename(extension));
 
-    audio_recorder
-        .stop_recording(Some(filepath.clone()), &config_data.audio.output_format)
-        .map_err(|err| {
-            tracing::error!("Failed to save recording: {}", err);
-            err
-        })?;
-
     if should_transcribe {
-        match transcribe_recording_with_animation(&mut tui, &filepath).await {
+        match finalize_and_transcribe_with_animation(
+            &mut tui,
+            audio_recorder,
+            filepath.clone(),
+            config_data.audio.output_format.clone(),
+        )
+        .await
+        {
             Ok(text) => {
                 if mode == RecordingMode::Remote {
                     if let Err(err) =
@@ -243,6 +245,13 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
                 eprintln!("Warning: Transcription failed: {err}");
             }
         }
+    } else {
+        audio_recorder
+            .stop_recording(Some(filepath.clone()), &config_data.audio.output_format)
+            .map_err(|err| {
+                tracing::error!("Failed to save recording: {}", err);
+                err
+            })?;
     }
 
     if let Some(err) = typing_error {
@@ -268,6 +277,86 @@ fn ostt_data_dir() -> anyhow::Result<PathBuf> {
         .join("ostt");
     fs::create_dir_all(&data_dir)?;
     Ok(data_dir)
+}
+
+fn ostt_state_dir() -> anyhow::Result<PathBuf> {
+    let state_dir = if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+        PathBuf::from(xdg_state).join("ostt")
+    } else {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+            .join(".local")
+            .join("state")
+            .join("ostt")
+    };
+    fs::create_dir_all(&state_dir)?;
+    Ok(state_dir)
+}
+
+fn transcription_debug_log_path() -> anyhow::Result<PathBuf> {
+    Ok(ostt_state_dir()?.join("transcription-latest.log"))
+}
+
+fn reset_transcription_debug_log(audio_path: &Path) {
+    let path = match transcription_debug_log_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!("Failed to resolve transcription debug log path: {}", err);
+            return;
+        }
+    };
+
+    let mut file = match fs::File::create(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::debug!("Failed to create transcription debug log: {}", err);
+            return;
+        }
+    };
+
+    let _ = writeln!(file, "timestamp={}", Utc::now().to_rfc3339());
+    let _ = writeln!(file, "audio_path={}", audio_path.display());
+    let _ = writeln!(file, "contextualize_bin={}", contextualize_bin());
+    let _ = writeln!(
+        file,
+        "contextualize_timeout_seconds={}",
+        read_transcription_timeout().as_secs()
+    );
+    let _ = writeln!(
+        file,
+        "whisper_url={}",
+        std::env::var("WHISPER_URL").unwrap_or_default()
+    );
+    let _ = writeln!(
+        file,
+        "whisper_api_base={}",
+        std::env::var("WHISPER_API_BASE").unwrap_or_default()
+    );
+    let _ = writeln!(
+        file,
+        "whisper_model={}",
+        std::env::var("WHISPER_MODEL").unwrap_or_default()
+    );
+}
+
+fn append_transcription_debug_log(message: impl AsRef<str>) {
+    let path = match transcription_debug_log_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::debug!("Failed to resolve transcription debug log path: {}", err);
+            return;
+        }
+    };
+
+    let mut file = match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::debug!("Failed to append transcription debug log: {}", err);
+            return;
+        }
+    };
+
+    let _ = writeln!(file, "{} {}", Utc::now().to_rfc3339(), message.as_ref());
 }
 
 fn keywords_file() -> anyhow::Result<PathBuf> {
@@ -348,7 +437,7 @@ fn prune_recording_cache(dir: &Path, now: SystemTime, retention: Duration) {
 
 fn build_contextualize_args(audio_path: &Path, keywords_path: Option<&Path>) -> Vec<OsString> {
     let mut args = vec![
-        OsString::from("--quiet"),
+        OsString::from("--verbose"),
         OsString::from("cat"),
         OsString::from("-f"),
         OsString::from("raw"),
@@ -373,10 +462,19 @@ async fn transcribe_recording_with_animation(
         return Err(anyhow::anyhow!("No audio was captured."));
     }
 
+    let contextualize = contextualize_bin();
+    let timeout = read_transcription_timeout();
+    reset_transcription_debug_log(audio_path);
     tracing::debug!(
-        "Starting contextualize transcription for file '{}'",
-        audio_path.display()
+        "Starting contextualize transcription for file '{}' with timeout {:?}",
+        audio_path.display(),
+        timeout
     );
+    append_transcription_debug_log(format!(
+        "phase=transcribe-start audio_path={} timeout_seconds={}",
+        audio_path.display(),
+        timeout.as_secs()
+    ));
 
     let keywords_path = keywords_file()?;
     let args = build_contextualize_args(
@@ -386,7 +484,9 @@ async fn transcribe_recording_with_animation(
     let mut animation = TranscriptionAnimation::new();
 
     let transcription_handle =
-        tokio::spawn(async move { run_transcription_command(CONTEXTUALIZE_BIN, &args).await });
+        tokio::spawn(
+            async move { run_transcription_command(&contextualize, &args, timeout).await },
+        );
 
     loop {
         if let Err(err) = tui.render_transcription_animation(&mut animation) {
@@ -403,6 +503,10 @@ async fn transcribe_recording_with_animation(
     match transcription_handle.await {
         Ok(Ok(text)) => {
             tracing::info!("Transcription completed: {}", text);
+            append_transcription_debug_log(format!(
+                "phase=transcribe-finished transcript_chars={}",
+                text.chars().count()
+            ));
 
             let mut history_manager = HistoryManager::new(&ostt_data_dir()?)?;
             if let Err(err) = history_manager.save_transcription(&text) {
@@ -419,6 +523,7 @@ async fn transcribe_recording_with_animation(
         }
         Ok(Err(err)) => {
             tracing::error!("Transcription failed: {}", err);
+            append_transcription_debug_log(format!("phase=transcribe-error error={}", err));
             tui.cleanup().ok();
             let mut error_screen = ErrorScreen::new()?;
             error_screen.show_error(&format!("Error: Transcription failed - {err}"))?;
@@ -427,6 +532,7 @@ async fn transcribe_recording_with_animation(
         }
         Err(err) => {
             tracing::error!("Transcription task failed: {}", err);
+            append_transcription_debug_log(format!("phase=transcribe-task-error error={}", err));
             tui.cleanup().ok();
             let mut error_screen = ErrorScreen::new()?;
             error_screen.show_error(&format!("Error: Transcription task failed - {err}"))?;
@@ -436,26 +542,112 @@ async fn transcribe_recording_with_animation(
     }
 }
 
-async fn run_transcription_command(program: &str, args: &[OsString]) -> anyhow::Result<String> {
-    tracing::debug!("Running transcription command: {} {:?}", program, args);
+async fn finalize_and_transcribe_with_animation(
+    tui: &mut OsttTui,
+    mut audio_recorder: AudioRecorder,
+    audio_path: PathBuf,
+    output_format: String,
+) -> anyhow::Result<String> {
+    append_transcription_debug_log("phase=finalize-start");
+    let save_handle = tokio::task::spawn_blocking(move || {
+        let recording = audio_recorder.finish_recording()?;
+        recording.save(Some(audio_path.clone()), &output_format)?;
+        Ok::<PathBuf, anyhow::Error>(audio_path)
+    });
 
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "Could not find '{}' on PATH. Install contextualize before recording.",
-                    program
-                )
-            } else {
-                anyhow::anyhow!("Failed to run '{}': {}", program, err)
-            }
-        })?;
+    let mut animation = TranscriptionAnimation::new();
+
+    loop {
+        if let Err(err) = tui.render_transcription_animation(&mut animation) {
+            tracing::warn!("Failed to render animation: {}", err);
+        }
+
+        if save_handle.is_finished() {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let audio_path = match save_handle.await {
+        Ok(Ok(path)) => {
+            append_transcription_debug_log(format!(
+                "phase=finalize-finished audio_path={}",
+                path.display()
+            ));
+            path
+        }
+        Ok(Err(err)) => {
+            tracing::error!("Failed to save recording: {}", err);
+            append_transcription_debug_log(format!("phase=finalize-error error={}", err));
+            tui.cleanup().ok();
+            let mut error_screen = ErrorScreen::new()?;
+            error_screen.show_error(&format!("Error: Failed to save recording - {err}"))?;
+            error_screen.cleanup()?;
+            return Err(err);
+        }
+        Err(err) => {
+            tracing::error!("Recording save task failed: {}", err);
+            append_transcription_debug_log(format!("phase=finalize-task-error error={}", err));
+            tui.cleanup().ok();
+            let mut error_screen = ErrorScreen::new()?;
+            error_screen.show_error(&format!("Error: Recording save task failed - {err}"))?;
+            error_screen.cleanup()?;
+            return Err(anyhow::anyhow!("Recording save task failed: {err}"));
+        }
+    };
+
+    transcribe_recording_with_animation(tui, &audio_path).await
+}
+
+async fn run_transcription_command(
+    program: &str,
+    args: &[OsString],
+    timeout_duration: Duration,
+) -> anyhow::Result<String> {
+    tracing::debug!("Running transcription command: {} {:?}", program, args);
+    append_transcription_debug_log(format!(
+        "phase=subprocess-spawn program={} args={:?}",
+        program, args
+    ));
+
+    let output = tokio::time::timeout(
+        timeout_duration,
+        tokio::process::Command::new(program)
+            .kill_on_drop(true)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        append_transcription_debug_log(format!(
+            "phase=subprocess-timeout program={} timeout_seconds={}",
+            program,
+            timeout_duration.as_secs().max(1)
+        ));
+        anyhow::anyhow!(
+            "{} timed out after {}s. Set OSTT_CONTEXTUALIZE_TIMEOUT_SECONDS to allow longer transcriptions.",
+            program,
+            timeout_duration.as_secs().max(1)
+        )
+    })?
+    .map_err(|err| {
+        append_transcription_debug_log(format!(
+            "phase=subprocess-spawn-error program={} error={}",
+            program, err
+        ));
+        if err.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "Could not find '{}' on PATH. Install contextualize before recording.",
+                program
+            )
+        } else {
+            anyhow::anyhow!("Failed to run '{}': {}", program, err)
+        }
+    })?;
 
     parse_transcription_output(program, &output.stdout, &output.stderr, output.status)
 }
@@ -467,6 +659,16 @@ fn parse_transcription_output(
     status: ExitStatus,
 ) -> anyhow::Result<String> {
     let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+    append_transcription_debug_log(format!(
+        "phase=subprocess-exit success={} status={} stdout_bytes={} stderr_bytes={}",
+        status.success(),
+        status,
+        stdout.len(),
+        stderr.len()
+    ));
+    if !stderr_text.is_empty() {
+        append_transcription_debug_log(format!("stderr={}", stderr_text));
+    }
     if !status.success() {
         if stderr_text.is_empty() {
             return Err(anyhow::anyhow!("{} exited with status {}", program, status));
@@ -708,6 +910,23 @@ fn ydotool_bin() -> String {
         .unwrap_or_else(|| "ydotool".to_string())
 }
 
+fn contextualize_bin() -> String {
+    std::env::var("OSTT_CONTEXTUALIZE_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| CONTEXTUALIZE_BIN.to_string())
+}
+
+fn read_transcription_timeout() -> Duration {
+    std::env::var("OSTT_CONTEXTUALIZE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TRANSCRIPTION_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -749,7 +968,7 @@ mod tests {
         assert_eq!(
             stringify(&args),
             vec![
-                "--quiet",
+                "--verbose",
                 "cat",
                 "-f",
                 "raw",
@@ -769,7 +988,7 @@ mod tests {
         assert_eq!(
             stringify(&args),
             vec![
-                "--quiet",
+                "--verbose",
                 "cat",
                 "-f",
                 "raw",
@@ -817,7 +1036,9 @@ mod tests {
             OsString::from("printf ' hello world \\n'"),
         ];
 
-        let transcript = run_transcription_command("sh", &args).await.unwrap();
+        let transcript = run_transcription_command("sh", &args, Duration::from_secs(1))
+            .await
+            .unwrap();
 
         assert_eq!(transcript, "hello world");
     }
@@ -826,7 +1047,9 @@ mod tests {
     #[tokio::test]
     async fn run_transcription_command_rejects_empty_stdout() {
         let args = vec![OsString::from("-c"), OsString::from("printf ''")];
-        let err = run_transcription_command("sh", &args).await.unwrap_err();
+        let err = run_transcription_command("sh", &args, Duration::from_secs(1))
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("returned no transcript"));
     }
@@ -838,17 +1061,34 @@ mod tests {
             OsString::from("-c"),
             OsString::from("printf 'boom' >&2; exit 3"),
         ];
-        let err = run_transcription_command("sh", &args).await.unwrap_err();
+        let err = run_transcription_command("sh", &args, Duration::from_secs(1))
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_transcription_command_times_out_for_stalled_process() {
+        let args = vec![OsString::from("-c"), OsString::from("sleep 5")];
+        let err = run_transcription_command("sh", &args, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
     }
 
     #[tokio::test]
     async fn run_transcription_command_reports_missing_binary() {
         let args: Vec<OsString> = Vec::new();
-        let err = run_transcription_command("ostt-binary-that-does-not-exist", &args)
-            .await
-            .unwrap_err();
+        let err = run_transcription_command(
+            "ostt-binary-that-does-not-exist",
+            &args,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.to_string().contains("Could not find"));
     }

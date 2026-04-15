@@ -23,6 +23,18 @@ for arg in "$@"; do
     esac
 done
 
+if [ -z "${WHISPER_URL:-}" ] && [ -n "${OSTT_TRANSCRIPTION_ENDPOINT:-}" ]; then
+    export WHISPER_URL="${OSTT_TRANSCRIPTION_ENDPOINT}"
+fi
+
+if [ -z "${WHISPER_MODEL:-}" ] && [ -n "${OSTT_TRANSCRIPTION_MODEL:-}" ]; then
+    export WHISPER_MODEL="${OSTT_TRANSCRIPTION_MODEL}"
+fi
+
+if [ -z "${WHISPER_API_KEY:-}" ] && [ -n "${OSTT_TRANSCRIPTION_API_KEY:-}" ]; then
+    export WHISPER_API_KEY="${OSTT_TRANSCRIPTION_API_KEY}"
+fi
+
 has_ostt_window() {
     if command -v niri >/dev/null 2>&1; then
         niri msg -j 2>/dev/null \
