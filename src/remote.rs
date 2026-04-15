@@ -140,7 +140,10 @@ async fn prepare_socket(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create remote socket directory {}", parent.display())
+                format!(
+                    "Failed to create remote socket directory {}",
+                    parent.display()
+                )
             })?;
         }
     }

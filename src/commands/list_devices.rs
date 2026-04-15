@@ -47,9 +47,7 @@ pub fn handle_list_devices() -> Result<(), anyhow::Error> {
     println!();
 
     // Find the default device
-    let default_device = host
-        .default_input_device()
-        .and_then(|d| d.name().ok());
+    let default_device = host.default_input_device().and_then(|d| d.name().ok());
 
     for (index, device) in device_results.iter().enumerate() {
         let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
@@ -64,9 +62,7 @@ pub fn handle_list_devices() -> Result<(), anyhow::Error> {
                 let channels = config.channels();
                 format!(" ({}Hz, {} channels)", sample_rate, channels)
             }
-            Err(_) => {
-                " (configuration unavailable)".to_string()
-            }
+            Err(_) => " (configuration unavailable)".to_string(),
         };
 
         println!("  ID: {}", index);
