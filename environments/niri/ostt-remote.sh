@@ -37,15 +37,15 @@ for arg in "$@"; do
     esac
 done
 
-if [ -z "${WHISPER_URL:-}" ] && [ -n "${OSTT_TRANSCRIPTION_ENDPOINT:-}" ]; then
+if [ -n "${OSTT_TRANSCRIPTION_ENDPOINT:-}" ]; then
     export WHISPER_URL="${OSTT_TRANSCRIPTION_ENDPOINT}"
 fi
 
-if [ -z "${WHISPER_MODEL:-}" ] && [ -n "${OSTT_TRANSCRIPTION_MODEL:-}" ]; then
+if [ -n "${OSTT_TRANSCRIPTION_MODEL:-}" ]; then
     export WHISPER_MODEL="${OSTT_TRANSCRIPTION_MODEL}"
 fi
 
-if [ -z "${WHISPER_API_KEY:-}" ] && [ -n "${OSTT_TRANSCRIPTION_API_KEY:-}" ]; then
+if [ -n "${OSTT_TRANSCRIPTION_API_KEY:-}" ]; then
     export WHISPER_API_KEY="${OSTT_TRANSCRIPTION_API_KEY}"
 fi
 
