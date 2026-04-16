@@ -445,7 +445,11 @@ impl OsttTui {
             let vol_span = ratatui::text::Span::raw(format!("{display_volume}%"));
 
             // Show pause symbol instead of red dot when paused
-            let indicator = if is_paused {
+            let dev_mode = std::env::var("OSTT_DEV").is_ok_and(|value| value == "1");
+            let dev_style = Style::default().fg(Color::Green);
+            let indicator = if dev_mode {
+                ratatui::text::Span::styled("◆ ", dev_style)
+            } else if is_paused {
                 ratatui::text::Span::styled("⏸ ", Style::default().fg(Color::Yellow))
             } else if cancel_active {
                 ratatui::text::Span::styled("● ", Style::default().fg(footer_inactive_color))
@@ -473,7 +477,22 @@ impl OsttTui {
                     .bg(footer_colors.footer_bg.to_color()),
             );
 
-            frame.render_widget(footer, footer_area);
+            if dev_mode && footer_area.width > 8 {
+                let chunks = Layout::horizontal([
+                    Constraint::Min(0),
+                    Constraint::Length(3),
+                ])
+                .split(footer_area);
+                frame.render_widget(footer, chunks[0]);
+                let dev_label = Paragraph::new("DEV").style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .bg(footer_colors.footer_bg.to_color()),
+                );
+                frame.render_widget(dev_label, chunks[1]);
+            } else {
+                frame.render_widget(footer, footer_area);
+            }
         })?;
 
         Ok(())

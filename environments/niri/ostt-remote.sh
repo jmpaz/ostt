@@ -3,22 +3,29 @@ set -euo pipefail
 
 OSTT_BIN="${OSTT_BIN:-ostt}"
 OSTT_DEV_BIN="${OSTT_DEV_BIN:-${HOME}/dev/ostt/target/debug/ostt}"
+OSTT_DEV_BIN_MISSING=0
 
 if [ "${OSTT_DEV:-0}" = "1" ]; then
-    if [ ! -x "${OSTT_DEV_BIN}" ]; then
-        if command -v notify-send >/dev/null 2>&1; then
-            notify-send "ostt dev binary not found" "Run: cd ~/dev/ostt && cargo build"
-        fi
-        echo "ostt dev binary not found: ${OSTT_DEV_BIN}" >&2
-        exit 1
+    if [ -x "${OSTT_DEV_BIN}" ]; then
+        OSTT_BIN="${OSTT_DEV_BIN}"
+    else
+        OSTT_DEV_BIN_MISSING=1
     fi
-    OSTT_BIN="${OSTT_DEV_BIN}"
 fi
 
 OSTT_CLASS="${OSTT_CLASS:-com.local.ostt}"
 OSTT_SOCKET="${OSTT_REMOTE_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/ostt.sock}"
 OSTT_LAUNCH_CMD="${OSTT_LAUNCH_CMD:-ghostty --class ${OSTT_CLASS} -e ${OSTT_BIN} remote}"
 export OSTT_BIN OSTT_CLASS
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+if [ "${OSTT_CLASS}" = "com.local.ostt.dev" ]; then
+    OSTT_PEER_CLASS="${OSTT_PEER_CLASS:-com.local.ostt}"
+    OSTT_PEER_SOCKET="${OSTT_PEER_SOCKET:-${RUNTIME_DIR}/ostt.sock}"
+else
+    OSTT_PEER_CLASS="${OSTT_PEER_CLASS:-com.local.ostt.dev}"
+    OSTT_PEER_SOCKET="${OSTT_PEER_SOCKET:-${RUNTIME_DIR}/ostt-dev.sock}"
+fi
 
 ACTION="complete"
 OUTPUT_MODE="${OSTT_REMOTE_OUTPUT_MODE:-paste}"
@@ -50,36 +57,53 @@ if [ -n "${OSTT_TRANSCRIPTION_API_KEY:-}" ]; then
 fi
 
 has_ostt_window() {
+    local class="$1"
     if command -v niri >/dev/null 2>&1; then
         niri msg -j 2>/dev/null \
-            | grep -Eq "\"app_id\"[[:space:]]*:[[:space:]]*\"${OSTT_CLASS}\""
+            | grep -Eq "\"app_id\"[[:space:]]*:[[:space:]]*\"${class}\""
     else
         return 1
     fi
 }
 
-if has_ostt_window; then
-    if [ "${ACTION}" = "complete" ] && [ "${OUTPUT_MODE}" = "type" ]; then
-        "${OSTT_BIN}" remote "${ACTION}" type || true
-    else
-        "${OSTT_BIN}" remote "${ACTION}" || true
-    fi
-    exit 0
-fi
-
-if [ -S "${OSTT_SOCKET}" ]; then
-    if "${OSTT_BIN}" remote ping >/dev/null 2>&1; then
+send_remote() {
+    local socket="$1"
+    if [ -S "${socket}" ] && OSTT_REMOTE_SOCKET="${socket}" "${OSTT_BIN}" remote ping >/dev/null 2>&1; then
         if [ "${ACTION}" = "complete" ] && [ "${OUTPUT_MODE}" = "type" ]; then
-            "${OSTT_BIN}" remote "${ACTION}" type || true
+            OSTT_REMOTE_SOCKET="${socket}" "${OSTT_BIN}" remote "${ACTION}" type || true
         else
-            "${OSTT_BIN}" remote "${ACTION}" || true
+            OSTT_REMOTE_SOCKET="${socket}" "${OSTT_BIN}" remote "${ACTION}" || true
         fi
+        return 0
+    fi
+    return 1
+}
+
+handle_existing() {
+    local class="$1"
+    local socket="$2"
+    if has_ostt_window "${class}"; then
+        send_remote "${socket}" || true
         exit 0
     fi
-fi
+    if send_remote "${socket}"; then
+        exit 0
+    fi
+}
+
+handle_existing "${OSTT_CLASS}" "${OSTT_SOCKET}"
+handle_existing "${OSTT_PEER_CLASS}" "${OSTT_PEER_SOCKET}"
 
 if [ "${ACTION}" = "cancel" ]; then
     exit 0
+fi
+
+if [ "${OSTT_DEV_BIN_MISSING}" = "1" ]; then
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "ostt dev binary not found" "Run: cd ~/dev/ostt && cargo build"
+    fi
+    echo "ostt dev binary not found: ${OSTT_DEV_BIN}" >&2
+    exit 1
 fi
 
 if [ "${OUTPUT_MODE}" != "paste" ]; then
