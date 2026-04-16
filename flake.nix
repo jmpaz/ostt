@@ -5,7 +5,8 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -14,8 +15,10 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forAllSystems = f:
-        lib.genAttrs systems (system:
+      forAllSystems =
+        f:
+        lib.genAttrs systems (
+          system:
           let
             pkgs = import nixpkgs { inherit system; };
           in
@@ -23,22 +26,45 @@
         );
     in
     {
-      packages = forAllSystems (pkgs:
+      packages = forAllSystems (
+        pkgs:
         let
+          linuxAlsaPlugins = pkgs.symlinkJoin {
+            name = "ostt-alsa-plugins";
+            paths = [
+              pkgs.alsa-plugins
+              pkgs.pipewire
+            ];
+          };
           linuxBuildInputs = lib.optionals pkgs.stdenv.isLinux [
             pkgs.alsa-lib
           ];
-          darwinBuildInputs = lib.optionals pkgs.stdenv.isDarwin (with pkgs.darwin.apple_sdk.frameworks; [
-            AudioToolbox
-            AudioUnit
-            CoreAudio
-            CoreFoundation
-          ]);
+          darwinBuildInputs = lib.optionals pkgs.stdenv.isDarwin (
+            with pkgs.darwin.apple_sdk.frameworks;
+            [
+              AudioToolbox
+              AudioUnit
+              CoreAudio
+              CoreFoundation
+            ]
+          );
           runtimePackages = [
             pkgs.ffmpeg
-          ] ++ lib.optionals pkgs.stdenv.isLinux [
+          ]
+          ++ lib.optionals pkgs.stdenv.isLinux [
             pkgs.wl-clipboard
             pkgs.xclip
+          ];
+          wrapperArgs = [
+            "--prefix"
+            "PATH"
+            ":"
+            (lib.makeBinPath runtimePackages)
+          ]
+          ++ lib.optionals pkgs.stdenv.isLinux [
+            "--set"
+            "ALSA_PLUGIN_DIR"
+            "${linuxAlsaPlugins}/lib/alsa-lib"
           ];
         in
         {
@@ -59,8 +85,7 @@
             buildInputs = linuxBuildInputs ++ darwinBuildInputs;
 
             postInstall = ''
-              wrapProgram "$out/bin/ostt" \
-                --prefix PATH : ${lib.makeBinPath runtimePackages}
+              wrapProgram "$out/bin/ostt" ${lib.escapeShellArgs wrapperArgs}
             '';
 
             meta = with lib; {
@@ -74,8 +99,16 @@
         }
       );
 
-      devShells = forAllSystems (pkgs:
+      devShells = forAllSystems (
+        pkgs:
         let
+          linuxAlsaPlugins = pkgs.symlinkJoin {
+            name = "ostt-alsa-plugins";
+            paths = [
+              pkgs.alsa-plugins
+              pkgs.pipewire
+            ];
+          };
           linuxBuildInputs = lib.optionals pkgs.stdenv.isLinux [
             pkgs.alsa-lib
           ];
@@ -88,7 +121,8 @@
             pkgs.rust-analyzer
             pkgs.rustc
             pkgs.rustfmt
-          ] ++ lib.optionals pkgs.stdenv.isLinux [
+          ]
+          ++ lib.optionals pkgs.stdenv.isLinux [
             pkgs.wl-clipboard
             pkgs.xclip
           ];
@@ -100,6 +134,7 @@
 
             shellHook = lib.optionalString pkgs.stdenv.isLinux ''
               export PKG_CONFIG_PATH="${pkgConfigPath}''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+              export ALSA_PLUGIN_DIR="${linuxAlsaPlugins}/lib/alsa-lib"
             '';
           };
         }

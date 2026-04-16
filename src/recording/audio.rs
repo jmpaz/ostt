@@ -112,7 +112,7 @@ impl AudioRecorder {
                 let device_name = device
                     .name()
                     .unwrap_or_else(|_| "Unknown device".to_string());
-                match self.activate_device(device) {
+                match suppress_alsa_warnings(|| self.activate_device(device)) {
                     Ok(()) => return Ok(()),
                     Err(err) => {
                         append_transcription_debug_log(format!(
@@ -131,7 +131,7 @@ impl AudioRecorder {
         }
 
         let device = suppress_alsa_warnings(|| find_device_by_name(&host, &self.device_name))?;
-        self.activate_device(device)
+        suppress_alsa_warnings(|| self.activate_device(device))
     }
 
     fn activate_device(&mut self, device: cpal::Device) -> Result<()> {
