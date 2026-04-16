@@ -341,6 +341,13 @@ Contributions are welcome! Please open an issue or submit a pull request.
 	<tbody>
 		<tr>
             <td align="center">
+                <a href="https://github.com/jmpaz">
+                    <img src="https://avatars.githubusercontent.com/u/30947643?v=4" width="100;" alt="jmpaz"/>
+                    <br />
+                    <sub><b>Josh Pazmino</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/kristoferlund">
                     <img src="https://avatars.githubusercontent.com/u/9698363?v=4" width="100;" alt="kristoferlund"/>
                     <br />
