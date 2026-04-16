@@ -2,9 +2,23 @@
 set -euo pipefail
 
 OSTT_BIN="${OSTT_BIN:-ostt}"
+OSTT_DEV_BIN="${OSTT_DEV_BIN:-${HOME}/dev/ostt/target/debug/ostt}"
+
+if [ "${OSTT_DEV:-0}" = "1" ]; then
+    if [ ! -x "${OSTT_DEV_BIN}" ]; then
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send "ostt dev binary not found" "Run: cd ~/dev/ostt && cargo build"
+        fi
+        echo "ostt dev binary not found: ${OSTT_DEV_BIN}" >&2
+        exit 1
+    fi
+    OSTT_BIN="${OSTT_DEV_BIN}"
+fi
+
 OSTT_CLASS="${OSTT_CLASS:-com.local.ostt}"
 OSTT_SOCKET="${OSTT_REMOTE_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/ostt.sock}"
 OSTT_LAUNCH_CMD="${OSTT_LAUNCH_CMD:-ghostty --class ${OSTT_CLASS} -e ${OSTT_BIN} remote}"
+export OSTT_BIN OSTT_CLASS
 
 ACTION="complete"
 OUTPUT_MODE="${OSTT_REMOTE_OUTPUT_MODE:-paste}"
