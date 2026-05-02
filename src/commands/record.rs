@@ -328,18 +328,18 @@ fn reset_transcription_debug_log(audio_path: &Path) {
     );
     let _ = writeln!(
         file,
-        "whisper_url={}",
-        std::env::var("WHISPER_URL").unwrap_or_default()
+        "openai_transcription_url={}",
+        std::env::var("OPENAI_TRANSCRIPTION_URL").unwrap_or_default()
     );
     let _ = writeln!(
         file,
-        "whisper_api_base={}",
-        std::env::var("WHISPER_API_BASE").unwrap_or_default()
+        "openai_transcription_api_base={}",
+        std::env::var("OPENAI_TRANSCRIPTION_API_BASE").unwrap_or_default()
     );
     let _ = writeln!(
         file,
-        "whisper_model={}",
-        std::env::var("WHISPER_MODEL").unwrap_or_default()
+        "openai_transcription_model={}",
+        std::env::var("OPENAI_TRANSCRIPTION_MODEL").unwrap_or_default()
     );
 }
 
@@ -452,6 +452,14 @@ fn build_contextualize_args(audio_path: &Path, keywords_path: Option<&Path>) -> 
     if let Some(path) = keywords_path {
         args.push(OsString::from("--transcribe-prompt-file"));
         args.push(path.as_os_str().to_os_string());
+    }
+
+    if let Ok(model) = std::env::var("OPENAI_TRANSCRIPTION_MODEL") {
+        let model = model.trim();
+        if !model.is_empty() {
+            args.push(OsString::from("--transcribe-model"));
+            args.push(OsString::from(model));
+        }
     }
 
     args.push(audio_path.as_os_str().to_os_string());
