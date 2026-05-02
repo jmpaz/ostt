@@ -238,6 +238,10 @@ pub async fn handle_record(mode: RecordingMode) -> Result<(), anyhow::Error> {
                         tracing::warn!("Remote output failed: {}", err);
                         typing_error = Some(err);
                     }
+                } else if let Err(err) = copy_to_clipboard(&text) {
+                    tracing::warn!("Failed to copy to clipboard: {}", err);
+                } else {
+                    tracing::debug!("Transcribed text copied to clipboard");
                 }
             }
             Err(err) => {
@@ -513,12 +517,6 @@ async fn transcribe_recording_with_animation(
                 tracing::warn!("Failed to save transcription to history: {}", err);
             }
 
-            if let Err(err) = copy_to_clipboard(&text) {
-                tracing::warn!("Failed to copy to clipboard: {}", err);
-            } else {
-                tracing::debug!("Transcribed text copied to clipboard");
-            }
-
             Ok(text)
         }
         Ok(Err(err)) => {
@@ -700,11 +698,14 @@ async fn output_transcription_with_feedback(
 ) -> anyhow::Result<()> {
     match resolve_output_mode(output_override) {
         remote::RemoteOutputMode::Paste => {
-            send_paste_shortcut().await?;
+            paste_transcription(text).await?;
             let header = paste_header_label();
             stream_transcription_preview(tui, text, &header).await?;
         }
         remote::RemoteOutputMode::Type => {
+            if let Err(err) = copy_to_clipboard(text) {
+                tracing::warn!("Failed to copy to clipboard before typing: {}", err);
+            }
             let header = type_header_label();
             type_transcription_with_feedback(tui, text, &header).await?;
         }
@@ -805,46 +806,100 @@ async fn stream_transcription_preview(
     Ok(())
 }
 
-async fn send_paste_shortcut() -> anyhow::Result<()> {
+async fn paste_transcription(text: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let status = tokio::process::Command::new(ydotool_bin())
-            .args(["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|err| anyhow::anyhow!("Failed to run ydotool: {err}"))?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("ydotool exited with status {status}"));
+        match paste_transcription_with_wrapctl(text).await {
+            Ok(()) => return Ok(()),
+            Err(err) if allow_ydotool_fallback() => {
+                tracing::warn!("wrapctl paste failed, falling back to ydotool: {}", err);
+                copy_to_clipboard(text)?;
+                return send_ydotool_paste_shortcut().await;
+            }
+            Err(err) => return Err(err),
         }
-        Ok(())
     }
 
     #[cfg(target_os = "macos")]
     {
-        let status = tokio::process::Command::new("osascript")
-            .args([
-                "-e",
-                "tell application \"System Events\" to keystroke \"v\" using command down",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|err| anyhow::anyhow!("Failed to run osascript: {err}"))?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("osascript exited with status {status}"));
-        }
-        return Ok(());
+        copy_to_clipboard(text)?;
+        send_macos_paste_shortcut().await
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        let _ = text;
         Err(anyhow::anyhow!(
             "Paste shortcut not supported on this platform"
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn paste_transcription_with_wrapctl(text: &str) -> anyhow::Result<()> {
+    let mut child = tokio::process::Command::new(wrapctl_bin())
+        .arg("paste-stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("Failed to start wrapctl: {err}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open wrapctl stdin"))?;
+    stdin.write_all(text.as_bytes()).await?;
+    drop(stdin);
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(anyhow::anyhow!(
+                "wrapctl paste-stdin exited with status {}",
+                output.status
+            ));
+        }
+        return Err(anyhow::anyhow!("wrapctl paste-stdin failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn send_ydotool_paste_shortcut() -> anyhow::Result<()> {
+    let status = tokio::process::Command::new(ydotool_bin())
+        .args(["key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to run ydotool: {err}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("ydotool exited with status {status}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn send_macos_paste_shortcut() -> anyhow::Result<()> {
+    let status = tokio::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to keystroke \"v\" using command down",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to run osascript: {err}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("osascript exited with status {status}"));
+    }
+
+    Ok(())
 }
 
 fn resolve_output_mode(
@@ -890,7 +945,7 @@ fn paste_header_label() -> String {
     }
     #[cfg(target_os = "linux")]
     {
-        "pasted via ctrl+shift+v".to_string()
+        "pasted via wrapd".to_string()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -908,6 +963,23 @@ fn ydotool_bin() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "ydotool".to_string())
+}
+
+fn wrapctl_bin() -> String {
+    std::env::var("OSTT_WRAPCTL_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "wrapctl".to_string())
+}
+
+fn allow_ydotool_fallback() -> bool {
+    std::env::var("OSTT_ALLOW_YDOTOOL_FALLBACK").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn contextualize_bin() -> String {

@@ -85,6 +85,7 @@
             buildInputs = linuxBuildInputs ++ darwinBuildInputs;
 
             postInstall = ''
+              install -Dm755 environments/niri/ostt-remote.sh "$out/libexec/ostt/ostt-remote.sh"
               wrapProgram "$out/bin/ostt" ${lib.escapeShellArgs wrapperArgs}
             '';
 
